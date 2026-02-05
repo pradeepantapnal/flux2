@@ -15,6 +15,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #ifdef USE_METAL
 #include "flux_metal.h"
@@ -87,6 +88,8 @@ extern float *flux_init_noise(int batch, int channels, int h, int w, int64_t see
 
 /* Qwen3 text encoder is implemented in flux_qwen3.c */
 
+static int flux_load_transformer_if_needed(flux_ctx *ctx);
+
 /* ========================================================================
  * Main Context Structure
  * ======================================================================== */
@@ -118,6 +121,8 @@ struct flux_ctx {
     /* Prompt embedding cache */
     emb_cache_t *emb_cache;
     int embed_cache_enabled;
+    int last_embed_cache_hit;
+    int last_embed_cache_known;
     char tokenizer_config_id[80];
     char model_revision_id[80];
 };
@@ -146,6 +151,30 @@ static void set_error(const char *msg) {
 static int file_exists(const char *path) {
     struct stat st;
     return stat(path, &st) == 0;
+}
+
+
+static int prefault_transformer_mmap_pages(const char *model_dir) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors", model_dir);
+
+    safetensors_file_t *sf = safetensors_open(path);
+    if (!sf || !sf->data || sf->file_size == 0) {
+        if (sf) safetensors_close(sf);
+        return 0;
+    }
+
+    const size_t page_size = 4096;
+    const volatile unsigned char *bytes = (const volatile unsigned char *)sf->data;
+    volatile unsigned char sink = 0;
+    for (size_t off = 0; off < sf->file_size; off += page_size) {
+        sink ^= bytes[off];
+    }
+    sink ^= bytes[sf->file_size - 1];
+    (void)sink;
+
+    safetensors_close(sf);
+    return 1;
 }
 
 
@@ -299,6 +328,35 @@ void flux_set_embed_cache(flux_ctx *ctx, int enable) {
     if (ctx->emb_cache) emb_lru_set_enabled(ctx->emb_cache, ctx->embed_cache_enabled);
 }
 
+int flux_last_embed_cache_hit(flux_ctx *ctx, int *out_known) {
+    if (!ctx) {
+        if (out_known) *out_known = 0;
+        return 0;
+    }
+    if (out_known) *out_known = ctx->last_embed_cache_known;
+    return ctx->last_embed_cache_hit;
+}
+
+int flux_preload_transformer(flux_ctx *ctx) {
+    if (!ctx) {
+        set_error("Invalid context");
+        return 0;
+    }
+    if (!flux_load_transformer_if_needed(ctx)) {
+        return 0;
+    }
+    if (ctx->use_mmap) {
+        if (flux_phase_callback) flux_phase_callback("prefaulting transformer mmap", 0);
+        int ok = prefault_transformer_mmap_pages(ctx->model_dir);
+        if (flux_phase_callback) flux_phase_callback("prefaulting transformer mmap", 1);
+        if (!ok) {
+            set_error("Failed to prefault transformer mmap pages");
+            return 0;
+        }
+    }
+    return 1;
+}
+
 void flux_release_text_encoder(flux_ctx *ctx) {
     if (!ctx || !ctx->qwen3_encoder) return;
 
@@ -352,9 +410,12 @@ void *flux_get_transformer(flux_ctx *ctx) {
 
 float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
     if (!ctx || !prompt) {
-        *out_seq_len = 0;
+        if (out_seq_len) *out_seq_len = 0;
         return NULL;
     }
+
+    ctx->last_embed_cache_known = 0;
+    ctx->last_embed_cache_hit = 0;
 
     if (ctx->embed_cache_enabled && ctx->emb_cache) {
         float *cached = NULL;
@@ -363,6 +424,8 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
                              ctx->tokenizer_config_id, ctx->model_revision_id,
                              &cached, &cached_seq, &cached_dim)) {
             if (cached && cached_seq > 0 && cached_dim == QWEN3_TEXT_DIM) {
+                ctx->last_embed_cache_known = 1;
+                ctx->last_embed_cache_hit = 1;
                 *out_seq_len = cached_seq;
                 return cached;
             }
@@ -415,6 +478,8 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
 
     *out_seq_len = QWEN3_MAX_SEQ_LEN;  /* Always 512 */
     if (ctx->embed_cache_enabled && ctx->emb_cache) {
+        ctx->last_embed_cache_known = 1;
+        ctx->last_embed_cache_hit = 0;
         emb_lru_store(ctx->emb_cache, prompt,
                         ctx->tokenizer_config_id, ctx->model_revision_id,
                         embeddings, QWEN3_MAX_SEQ_LEN, QWEN3_TEXT_DIM);
@@ -1089,6 +1154,11 @@ flux_status_t flux_ctx_set_embed_cache(flux_ctx *ctx, int enable) {
     if (!ctx) return FLUX_STATUS_INVALID_ARGUMENT;
     flux_set_embed_cache(ctx, enable);
     return FLUX_STATUS_OK;
+}
+
+flux_status_t flux_ctx_preload_transformer(flux_ctx *ctx) {
+    if (!ctx) return FLUX_STATUS_INVALID_ARGUMENT;
+    return flux_preload_transformer(ctx) ? FLUX_STATUS_OK : FLUX_STATUS_RUNTIME_ERROR;
 }
 
 flux_status_t flux_generate_status(flux_ctx *ctx, const char *prompt,

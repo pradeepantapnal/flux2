@@ -145,6 +145,17 @@ void flux_set_strict(flux_ctx *ctx, int enable);
 /* Enable/disable prompt embedding cache (enabled by default). */
 void flux_set_embed_cache(flux_ctx *ctx, int enable);
 
+/* Eagerly load transformer before first denoising step.
+ * In mmap mode, also walks mapped pages sequentially once to prefault weights.
+ * Returns 1 on success, 0 on failure. */
+int flux_preload_transformer(flux_ctx *ctx);
+
+/* Return whether last prompt-encoding lookup hit the embedding cache.
+ * If out_known is set to 1, return value is 1 for hit, 0 for miss.
+ * If out_known is 0, cache was disabled or prompt encoding was not used.
+ */
+int flux_last_embed_cache_hit(flux_ctx *ctx, int *out_known);
+
 /*
  * Text-to-image generation.
  * Returns newly allocated image, caller must free with flux_image_free().
@@ -302,6 +313,7 @@ flux_status_t flux_ctx_release_text_encoder(flux_ctx *ctx);
 flux_status_t flux_ctx_set_mmap(flux_ctx *ctx, int enable);
 flux_status_t flux_ctx_set_strict(flux_ctx *ctx, int enable);
 flux_status_t flux_ctx_set_embed_cache(flux_ctx *ctx, int enable);
+flux_status_t flux_ctx_preload_transformer(flux_ctx *ctx);
 
 flux_status_t flux_generate_status(flux_ctx *ctx, const char *prompt,
                                    const flux_params *params, flux_image **out_image);
