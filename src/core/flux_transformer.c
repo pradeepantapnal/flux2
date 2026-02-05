@@ -285,19 +285,10 @@ typedef struct flux_transformer {
 } flux_transformer_t;
 
 int flux_transformer_prefault_mmap(flux_transformer_t *tf) {
-    if (!tf || !tf->use_mmap || !tf->sf || !tf->sf->data || tf->sf->file_size == 0) {
+    if (!tf || !tf->use_mmap || !tf->sf) {
         return 0;
     }
-
-    const size_t page_size = 4096;
-    const volatile unsigned char *bytes = (const volatile unsigned char *)tf->sf->data;
-    volatile unsigned char sink = 0;
-    for (size_t off = 0; off < tf->sf->file_size; off += page_size) {
-        sink ^= bytes[off];
-    }
-    sink ^= bytes[tf->sf->file_size - 1];
-    (void)sink;
-    return 1;
+    return safetensors_prefault_tensor_pages(tf->sf);
 }
 
 /* Forward declarations */

@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
+#include <inttypes.h>
 
 #ifdef USE_METAL
 #include "flux_metal.h"
@@ -117,6 +118,8 @@ struct flux_ctx {
 
     /* Memory mode */
     int use_mmap;  /* Use mmap for text encoder (lower memory, slower) */
+    int no_mmap_force;
+    int resident_budget_checked;
 
     /* Generation behavior */
     int strict_mode;
@@ -171,6 +174,134 @@ static void set_error(const char *msg) {
 static int file_exists(const char *path) {
     struct stat st;
     return stat(path, &st) == 0;
+}
+
+
+static uint64_t file_size_bytes(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size < 0) return 0;
+    return (uint64_t)st.st_size;
+}
+
+static uint64_t detect_total_memory_bytes(void) {
+#if defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_sz = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page_sz > 0) {
+        return (uint64_t)pages * (uint64_t)page_sz;
+    }
+#endif
+    return 0;
+}
+
+static uint64_t qwen3_work_bytes_estimate(void) {
+    const uint64_t f = sizeof(float);
+    uint64_t seq = QWEN3_MAX_SEQ_LEN, hidden = QWEN3_HIDDEN_SIZE;
+    uint64_t num_heads = QWEN3_NUM_HEADS, num_kv = QWEN3_NUM_KV_HEADS, head_dim = QWEN3_HEAD_DIM;
+    uint64_t inter = QWEN3_INTERMEDIATE_SIZE;
+    uint64_t total = 0;
+    total += seq * hidden * f * 2; /* hidden_state + residual */
+    total += seq * num_heads * head_dim * f;
+    total += 2 * seq * num_kv * head_dim * f;
+    total += num_heads * seq * seq * f;
+    total += seq * num_heads * head_dim * f;
+    total += 2 * seq * inter * f;
+    total += seq * hidden * f * 2;
+    total += 4 * seq * head_dim * f;
+    total += 3 * seq * hidden * f;
+    return total;
+}
+
+static uint64_t transformer_work_bytes_estimate(void) {
+    return 1024ULL * 1024ULL * 1024ULL; /* conservative scratch/workspace headroom */
+}
+
+static void format_bytes_u64(uint64_t n, char *buf, size_t buf_sz) {
+    const char *units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    double v = (double)n;
+    int u = 0;
+    while (v >= 1024.0 && u < 4) { v /= 1024.0; u++; }
+    snprintf(buf, buf_sz, "%.2f %s", v, units[u]);
+}
+
+static int estimate_resident_weight_bytes(const flux_ctx *ctx,
+                                          uint64_t *out_vae,
+                                          uint64_t *out_qwen3,
+                                          uint64_t *out_transformer,
+                                          uint64_t *out_total) {
+    if (!ctx || !ctx->model_dir[0]) return 0;
+    char path[1024];
+
+    snprintf(path, sizeof(path), "%s/vae/diffusion_pytorch_model.safetensors", ctx->model_dir);
+    uint64_t vae = file_size_bytes(path);
+
+    snprintf(path, sizeof(path), "%s/text_encoder/model-00001-of-00002.safetensors", ctx->model_dir);
+    uint64_t q1 = file_size_bytes(path);
+    snprintf(path, sizeof(path), "%s/text_encoder/model-00002-of-00002.safetensors", ctx->model_dir);
+    uint64_t q2 = file_size_bytes(path);
+
+    snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors", ctx->model_dir);
+    uint64_t tf = file_size_bytes(path);
+
+#ifdef USE_METAL
+    const uint64_t q_mult = 1, tf_mult = 1;
+#else
+    const uint64_t q_mult = 2, tf_mult = 2;
+#endif
+
+    uint64_t qwen = (q1 + q2) * q_mult + qwen3_work_bytes_estimate();
+    uint64_t transformer = tf * tf_mult + transformer_work_bytes_estimate();
+    uint64_t total = vae + qwen + transformer;
+
+    if (out_vae) *out_vae = vae;
+    if (out_qwen3) *out_qwen3 = qwen;
+    if (out_transformer) *out_transformer = transformer;
+    if (out_total) *out_total = total;
+    return (vae > 0 && q1 > 0 && q2 > 0 && tf > 0) ? 1 : 0;
+}
+
+static int flux_validate_no_mmap_budget(flux_ctx *ctx) {
+    if (!ctx || ctx->use_mmap || ctx->resident_budget_checked) return 1;
+
+    uint64_t vae = 0, qwen = 0, transformer = 0, total = 0;
+    if (!estimate_resident_weight_bytes(ctx, &vae, &qwen, &transformer, &total)) {
+        set_error("Failed to estimate --no-mmap resident memory requirement");
+        return 0;
+    }
+
+    uint64_t detected_mem = detect_total_memory_bytes();
+    const uint64_t fixed_cap = 24ULL * 1024ULL * 1024ULL * 1024ULL;
+    uint64_t limit = fixed_cap;
+    if (detected_mem > 0) {
+        uint64_t seventy = (detected_mem * 70ULL) / 100ULL;
+        limit = (seventy < fixed_cap) ? seventy : fixed_cap;
+    }
+
+    if (ctx->runtime_diagnostics) {
+        char b1[32], b2[32], b3[32], bt[32], bl[32];
+        format_bytes_u64(vae, b1, sizeof(b1));
+        format_bytes_u64(qwen, b2, sizeof(b2));
+        format_bytes_u64(transformer, b3, sizeof(b3));
+        format_bytes_u64(total, bt, sizeof(bt));
+        format_bytes_u64(limit, bl, sizeof(bl));
+        fprintf(stderr, "diag: resident bytes estimate vae=%s qwen3=%s transformer=%s total=%s limit=%s\n",
+                b1, b2, b3, bt, bl);
+    }
+
+    if (total > limit && !ctx->no_mmap_force) {
+        char bt[32], bl[32];
+        format_bytes_u64(total, bt, sizeof(bt));
+        format_bytes_u64(limit, bl, sizeof(bl));
+        set_error("--no-mmap requires too much resident memory; rerun with --mmap or override with --no-mmap-force");
+        fprintf(stderr,
+                "Error: --no-mmap estimated resident memory %s exceeds safe limit %s.\n"
+                "       Use --mmap (recommended) or pass --no-mmap-force to override.\n",
+                bt, bl);
+        return 0;
+    }
+
+    ctx->resident_budget_checked = 1;
+    return 1;
 }
 
 
@@ -369,6 +500,13 @@ flux_ctx *flux_load_dir(const char *model_dir) {
         }
     }
 
+    if (ctx->runtime_diagnostics) {
+        uint64_t vae_b = 0;
+        estimate_resident_weight_bytes(ctx, &vae_b, NULL, NULL, NULL);
+        char b[32]; format_bytes_u64(vae_b, b, sizeof(b));
+        fprintf(stderr, "diag: resident alloc estimate component=vae bytes=%s\n", b);
+    }
+
     /* Verify VAE is loaded */
     if (!ctx->vae) {
         set_error("Failed to load VAE - cannot generate images");
@@ -404,7 +542,14 @@ void flux_free(flux_ctx *ctx) {
 }
 
 void flux_set_mmap(flux_ctx *ctx, int enable) {
-    if (ctx) ctx->use_mmap = enable;
+    if (ctx) {
+        ctx->use_mmap = enable;
+        ctx->resident_budget_checked = 0;
+    }
+}
+
+void flux_set_no_mmap_force(flux_ctx *ctx, int enable) {
+    if (ctx) ctx->no_mmap_force = enable ? 1 : 0;
 }
 
 void flux_set_strict(flux_ctx *ctx, int enable) {
@@ -432,6 +577,23 @@ void flux_set_runtime_diagnostics(flux_ctx *ctx, int enable) {
     ctx->runtime_diagnostics = enable ? 1 : 0;
     flux_qwen3_set_runtime_diag(ctx->runtime_diagnostics);
     flux_transformer_set_runtime_diag(ctx->runtime_diagnostics);
+
+    if (ctx->runtime_diagnostics && !ctx->use_mmap) {
+        uint64_t vae_b = 0, q_b = 0, t_b = 0, total = 0;
+        if (estimate_resident_weight_bytes(ctx, &vae_b, &q_b, &t_b, &total)) {
+            char b1[32], b2[32], b3[32], bt[32];
+            format_bytes_u64(vae_b, b1, sizeof(b1));
+            format_bytes_u64(q_b, b2, sizeof(b2));
+            format_bytes_u64(t_b, b3, sizeof(b3));
+            format_bytes_u64(total, bt, sizeof(bt));
+            fprintf(stderr,
+                    "diag: resident alloc estimate component=vae bytes=%s\n"
+                    "diag: resident alloc estimate component=qwen3 bytes=%s\n"
+                    "diag: resident alloc estimate component=transformer bytes=%s\n"
+                    "diag: resident alloc estimate component=total bytes=%s\n",
+                    b1, b2, b3, bt);
+        }
+    }
 }
 
 int flux_last_embed_cache_hit(flux_ctx *ctx, int *out_known) {
@@ -469,10 +631,32 @@ int flux_preload_transformer(flux_ctx *ctx) {
         set_error("Invalid context");
         return 0;
     }
+
+    if (ctx->use_mmap && !ctx->qwen3_encoder && ctx->model_dir[0]) {
+        if (flux_phase_callback) flux_phase_callback("Loading Qwen3 encoder", 0);
+        ctx->qwen3_encoder = qwen3_encoder_load(ctx->model_dir, ctx->use_mmap);
+        if (flux_phase_callback) flux_phase_callback("Loading Qwen3 encoder", 1);
+        if (!ctx->qwen3_encoder) {
+            set_error("Failed to load Qwen3 encoder");
+            return 0;
+        }
+    }
+
     if (!flux_load_transformer_if_needed(ctx)) {
         return 0;
     }
+
     if (ctx->use_mmap) {
+        if (ctx->qwen3_encoder) {
+            if (flux_phase_callback) flux_phase_callback("prefaulting qwen3 mmap", 0);
+            int q_ok = qwen3_encoder_prefault_mmap(ctx->qwen3_encoder);
+            if (flux_phase_callback) flux_phase_callback("prefaulting qwen3 mmap", 1);
+            if (!q_ok) {
+                set_error("Failed to prefault Qwen3 mmap pages");
+                return 0;
+            }
+        }
+
         if (flux_phase_callback) flux_phase_callback("prefaulting transformer mmap", 0);
         int ok = flux_transformer_prefault_mmap(ctx->transformer);
         if (flux_phase_callback) flux_phase_callback("prefaulting transformer mmap", 1);
@@ -501,6 +685,8 @@ void flux_release_text_encoder(flux_ctx *ctx) {
 static int flux_load_transformer_if_needed(flux_ctx *ctx) {
     if (ctx->transformer) return 1;  /* Already loaded */
 
+    if (!flux_validate_no_mmap_budget(ctx)) return 0;
+
     char path[1024];
     snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors",
              ctx->model_dir);
@@ -522,6 +708,12 @@ static int flux_load_transformer_if_needed(flux_ctx *ctx) {
     if (!ctx->transformer) {
         set_error("Failed to load transformer");
         return 0;
+    }
+    if (!ctx->use_mmap && ctx->runtime_diagnostics) {
+        uint64_t t_bytes = 0;
+        estimate_resident_weight_bytes(ctx, NULL, NULL, &t_bytes, NULL);
+        char b[32]; format_bytes_u64(t_bytes, b, sizeof(b));
+        fprintf(stderr, "diag: resident alloc estimate component=transformer bytes=%s\n", b);
     }
     return 1;
 }
@@ -584,6 +776,11 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
         }
     }
 
+    if (!flux_validate_no_mmap_budget(ctx)) {
+        *out_seq_len = 0;
+        return NULL;
+    }
+
     /* Load encoder if not already loaded */
     if (!ctx->qwen3_encoder && ctx->model_dir[0]) {
         if (flux_phase_callback) flux_phase_callback("Loading Qwen3 encoder", 0);
@@ -591,6 +788,12 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
         if (flux_phase_callback) flux_phase_callback("Loading Qwen3 encoder", 1);
         if (!ctx->qwen3_encoder && ctx->strict_mode) {
             set_error("Strict mode: failed to load Qwen3 text encoder");
+        }
+        if (ctx->qwen3_encoder && !ctx->use_mmap && ctx->runtime_diagnostics) {
+            uint64_t q_bytes = 0;
+            estimate_resident_weight_bytes(ctx, NULL, &q_bytes, NULL, NULL);
+            char b[32]; format_bytes_u64(q_bytes, b, sizeof(b));
+            fprintf(stderr, "diag: resident alloc estimate component=qwen3 bytes=%s\n", b);
         }
     }
 
@@ -1295,6 +1498,12 @@ flux_status_t flux_ctx_release_text_encoder(flux_ctx *ctx) {
 flux_status_t flux_ctx_set_mmap(flux_ctx *ctx, int enable) {
     if (!ctx) return FLUX_STATUS_INVALID_ARGUMENT;
     flux_set_mmap(ctx, enable);
+    return FLUX_STATUS_OK;
+}
+
+flux_status_t flux_ctx_set_no_mmap_force(flux_ctx *ctx, int enable) {
+    if (!ctx) return FLUX_STATUS_INVALID_ARGUMENT;
+    flux_set_no_mmap_force(ctx, enable);
     return FLUX_STATUS_OK;
 }
 

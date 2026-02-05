@@ -1086,6 +1086,21 @@ static int load_layer_weights_bf16(qwen3_layer_t *layer, safetensors_file_t **fi
             layer->mlp.down_proj_weight_bf16);
 }
 
+static int qwen3_check_work_allocations(const qwen3_model_t *model) {
+    if (!model) return 0;
+    if (!model->rope_cos || !model->rope_sin ||
+        !model->hidden_state || !model->residual || !model->q_buf || !model->k_buf || !model->v_buf ||
+        !model->attn_scores || !model->attn_out || !model->mlp_gate || !model->mlp_up ||
+        !model->mlp_out || !model->norm_buf || !model->attn_q_head || !model->attn_k_head_t ||
+        !model->attn_v_head || !model->attn_out_head) {
+        return 0;
+    }
+    for (int i = 0; i < 3; i++) {
+        if (!model->layer_outputs[i]) return 0;
+    }
+    return 1;
+}
+
 /* Free a single layer's weights (used in mmap streaming mode) */
 static void free_layer_weights(qwen3_layer_t *layer) {
     free(layer->input_layernorm_weight);
@@ -1163,6 +1178,10 @@ qwen3_model_t *qwen3_model_load(const char *model_dir) {
     int half_dim = QWEN3_HEAD_DIM / 2;
     model->rope_cos = malloc(max_seq * half_dim * sizeof(float));
     model->rope_sin = malloc(max_seq * half_dim * sizeof(float));
+    if (!model->rope_cos || !model->rope_sin) {
+        fprintf(stderr, "qwen3_model_load: out of memory allocating RoPE buffers\n");
+        goto error;
+    }
     compute_rope_freqs(model->rope_cos, model->rope_sin, max_seq,
                        QWEN3_HEAD_DIM, QWEN3_ROPE_THETA);
 
@@ -1193,6 +1212,11 @@ qwen3_model_t *qwen3_model_load(const char *model_dir) {
 
     for (int i = 0; i < 3; i++) {
         model->layer_outputs[i] = malloc(seq_len * hidden * sizeof(float));
+    }
+
+    if (!qwen3_check_work_allocations(model)) {
+        fprintf(stderr, "qwen3_model_load: out of memory allocating work buffers\n");
+        goto error;
     }
 
     return model;
@@ -1263,6 +1287,10 @@ qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
     int half_dim = QWEN3_HEAD_DIM / 2;
     model->rope_cos = malloc(max_seq * half_dim * sizeof(float));
     model->rope_sin = malloc(max_seq * half_dim * sizeof(float));
+    if (!model->rope_cos || !model->rope_sin) {
+        fprintf(stderr, "qwen3_model_load_mmap: out of memory allocating RoPE buffers\n");
+        goto error;
+    }
     compute_rope_freqs(model->rope_cos, model->rope_sin, max_seq,
                        QWEN3_HEAD_DIM, QWEN3_ROPE_THETA);
 
@@ -1292,6 +1320,11 @@ qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
 
     for (int i = 0; i < 3; i++) {
         model->layer_outputs[i] = malloc(seq_len * hidden * sizeof(float));
+    }
+
+    if (!qwen3_check_work_allocations(model)) {
+        fprintf(stderr, "qwen3_model_load_mmap: out of memory allocating work buffers\n");
+        goto error;
     }
 
     return model;
@@ -1397,6 +1430,21 @@ void qwen3_encoder_free(qwen3_encoder_t *enc) {
     qwen3_tokenizer_free(enc->tokenizer);
     qwen3_model_free(enc->model);
     free(enc);
+}
+
+
+int qwen3_encoder_prefault_mmap(qwen3_encoder_t *enc) {
+    if (!enc || !enc->model) return 0;
+
+    qwen3_model_t *model = enc->model;
+    if (!model->use_mmap) return 1;
+
+    for (int i = 0; i < 2; i++) {
+        if (model->sf_files[i] && !safetensors_prefault_tensor_pages(model->sf_files[i])) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 float *qwen3_encode_text(qwen3_encoder_t *enc, const char *prompt) {

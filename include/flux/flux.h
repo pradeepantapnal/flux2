@@ -135,6 +135,9 @@ void flux_release_text_encoder(flux_ctx *ctx);
  */
 void flux_set_mmap(flux_ctx *ctx, int enable);
 
+/* Allow overriding resident-memory safety guard for --no-mmap mode. */
+void flux_set_no_mmap_force(flux_ctx *ctx, int enable);
+
 /*
  * Enable strict mode.
  * In strict mode, generation fails if prompt embeddings are unavailable
@@ -335,6 +338,7 @@ flux_status_t flux_ctx_load(flux_ctx **out_ctx, const char *model_dir);
 flux_status_t flux_ctx_free(flux_ctx *ctx);
 flux_status_t flux_ctx_release_text_encoder(flux_ctx *ctx);
 flux_status_t flux_ctx_set_mmap(flux_ctx *ctx, int enable);
+flux_status_t flux_ctx_set_no_mmap_force(flux_ctx *ctx, int enable);
 flux_status_t flux_ctx_set_strict(flux_ctx *ctx, int enable);
 flux_status_t flux_ctx_set_embed_cache(flux_ctx *ctx, int enable);
 flux_status_t flux_ctx_set_embed_cache_dir(flux_ctx *ctx, const char *path);

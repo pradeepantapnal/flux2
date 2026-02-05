@@ -140,6 +140,12 @@ void qwen3_encoder_free(qwen3_encoder_t *enc);
  */
 float *qwen3_encode_text(qwen3_encoder_t *enc, const char *prompt);
 
+/*
+ * Prefault mmap-backed Qwen3 tensor pages (mmap mode only).
+ * Returns 1 on success, 0 on invalid input or prefault failure.
+ */
+int qwen3_encoder_prefault_mmap(qwen3_encoder_t *enc);
+
 #ifdef __cplusplus
 }
 #endif
