@@ -1,8 +1,11 @@
 # FLUX.2 klein 4B - Pure C Inference Engine
 
 CC = gcc
+CUDA_HOME ?= /usr/local/cuda-13.0
+NVCC = $(CUDA_HOME)/bin/nvcc
 CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math -Iinclude/flux
 LDFLAGS = -lm
+CUDA_LIB_DIR = $(CUDA_HOME)/targets/x86_64-linux/lib
 
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
@@ -21,15 +24,18 @@ CORE_SRCS = \
 	src/core/terminals.c
 CLI_SRCS = src/cli/flux_cli.c src/core/linenoise.c src/core/embcache.c
 APP_SRCS = src/app/main.c
+CUDA_SRCS = src/backends/cuda/flux_cuda.cu
 SRCS = $(CORE_SRCS) $(CLI_SRCS) $(APP_SRCS)
 OBJS = $(SRCS:.c=.o)
+CUDA_C_OBJS = $(CORE_SRCS:.c=.cuda.o) $(CLI_SRCS:.c=.cuda.o) src/app/main.cuda.o
+CUDA_OBJS = $(CUDA_SRCS:.cu=.cuda.o)
 TARGET = flux
 LIB = libflux.a
 
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address -Iinclude/flux
 SANITIZER_COMMON = -Wall -Wextra -O1 -g -fno-omit-frame-pointer -Iinclude/flux -DGENERIC_BUILD
 
-.PHONY: all clean debug lib install info test pngtest help generic blas mps golden-test asan ubsan
+.PHONY: all clean debug lib install info test pngtest help generic blas mps golden-test asan ubsan cuda
 
 all: help
 
@@ -41,6 +47,7 @@ help:
 	@echo "  make blas     - With BLAS acceleration (~30x faster)"
 	@echo "  make asan     - Build with Address+Undefined sanitizers (clang)"
 	@echo "  make ubsan    - Build with Undefined sanitizer (clang)"
+	@echo "  make cuda     - CUDA backend scaffold (CUDA 13.0)"
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
 	@echo "  make mps      - Apple Silicon with Metal GPU (fastest)"
@@ -135,6 +142,23 @@ ubsan: clean $(TARGET)
 	@echo ""
 	@echo "Built with UBSan (clang, generic backend)"
 
+CUDA_CFLAGS = $(CFLAGS_BASE) -DUSE_CUDA -I$(CUDA_HOME)/include -Isrc/backends/cuda -DCUDA_HOME_STR=\"$(CUDA_HOME)\"
+CUDA_NVFLAGS = -O3 -DUSE_CUDA -Iinclude/flux -I$(CUDA_HOME)/include -Isrc/backends/cuda -Xcompiler "-Wall -Wextra"
+CUDA_LDFLAGS = -L$(CUDA_LIB_DIR) -lcudart -lcublas -lcublasLt -lm
+
+cuda: clean cuda-build
+	@echo ""
+	@echo "Built with CUDA backend scaffold (USE_CUDA)"
+
+cuda-build: $(CUDA_C_OBJS) $(CUDA_OBJS)
+	$(NVCC) -o $(TARGET) $^ $(CUDA_LDFLAGS)
+
+%.cuda.o: %.c
+	$(CC) $(CUDA_CFLAGS) -c -o $@ $<
+
+%.cuda.o: %.cu
+	$(NVCC) $(CUDA_NVFLAGS) -c -o $@ $<
+
 test:
 	@python3 run_test.py --flux-binary ./$(TARGET)
 
@@ -163,6 +187,7 @@ install: $(TARGET) $(LIB)
 
 clean:
 	rm -f $(OBJS) $(CORE_SRCS:.c=.mps.o) $(CLI_SRCS:.c=.mps.o) src/app/main.mps.o flux_metal.o $(TARGET) $(LIB)
+	rm -f $(CUDA_C_OBJS) $(CUDA_OBJS)
 	rm -f flux_shaders_source.h
 
 info:
