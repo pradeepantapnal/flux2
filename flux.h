@@ -125,6 +125,13 @@ void flux_release_text_encoder(flux_ctx *ctx);
 void flux_set_mmap(flux_ctx *ctx, int enable);
 
 /*
+ * Enable strict mode.
+ * In strict mode, generation fails if prompt embeddings are unavailable
+ * (for example, if Qwen3 encoder loading or encoding fails).
+ */
+void flux_set_strict(flux_ctx *ctx, int enable);
+
+/*
  * Text-to-image generation.
  * Returns newly allocated image, caller must free with flux_image_free().
  * Returns NULL on error.

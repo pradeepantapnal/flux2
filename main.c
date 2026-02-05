@@ -222,6 +222,9 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "      --show            Display image in terminal (auto-detects Kitty/Ghostty/iTerm2)\n");
     fprintf(stderr, "      --show-steps      Display each denoising step (slower)\n\n");
     fprintf(stderr, "Other options:\n");
+    fprintf(stderr, "      --smoke, --no-weights\n                        Run no-weights smoke check and exit\n");
+    fprintf(stderr, "      --timing          Print machine-readable JSON timing summary to stdout\n");
+    fprintf(stderr, "      --strict          Fail if prompt embeddings are unavailable\n");
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
     fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default, fastest on MPS)\n");
     fprintf(stderr, "      --no-mmap         Disable mmap, load all weights upfront\n");
@@ -266,6 +269,10 @@ int main(int argc, char *argv[]) {
         {"show",       no_argument,       0, 'k'},
         {"show-steps", no_argument,       0, 'K'},
         {"debug-py",   no_argument,       0, 'D'},
+        {"smoke",      no_argument,       0, 'x'},
+        {"no-weights", no_argument,       0, 'x'},
+        {"timing",     no_argument,       0, 't'},
+        {"strict",     no_argument,       0, 'r'},
         {0, 0, 0, 0}
     };
 
@@ -290,10 +297,13 @@ int main(int argc, char *argv[]) {
     int show_image = 0;
     int show_steps = 0;
     int debug_py = 0;
+    int smoke_mode = 0;
+    int timing_output = 0;
+    int strict_mode = 0;
     term_graphics_proto graphics_proto = detect_terminal_graphics();
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:g:S:i:t:e:n:qvhVmMD",
+    while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:S:i:e:n:qvhVmMDkKtxr",
                               long_options, NULL)) != -1) {
         switch (opt) {
             case 'd': model_dir = optarg; break;
@@ -323,10 +333,31 @@ int main(int argc, char *argv[]) {
             case 'k': show_image = 1; break;
             case 'K': show_steps = 1; break;
             case 'D': debug_py = 1; break;
+            case 'x': smoke_mode = 1; break;
+            case 't': timing_output = 1; break;
+            case 'r': strict_mode = 1; break;
             default:
                 print_usage(argv[0]);
                 return 1;
         }
+    }
+
+    if (smoke_mode) {
+        /* Smoke mode: validate argument parsing and basic runtime setup without model files. */
+        if (params.width < 64 || params.width > 4096) {
+            fprintf(stderr, "Error: Width must be between 64 and 4096\n");
+            return 1;
+        }
+        if (params.height < 64 || params.height > 4096) {
+            fprintf(stderr, "Error: Height must be between 64 and 4096\n");
+            return 1;
+        }
+        if (params.num_steps < 1 || params.num_steps > FLUX_MAX_STEPS) {
+            fprintf(stderr, "Error: Steps must be between 1 and %d\n", FLUX_MAX_STEPS);
+            return 1;
+        }
+        printf("SMOKE OK\n");
+        return 0;
     }
 
     /* Validate required arguments */
@@ -408,6 +439,7 @@ int main(int argc, char *argv[]) {
         flux_set_mmap(ctx, 1);
         LOG_VERBOSE("  Using mmap mode for text encoder (lower memory)\n");
     }
+    flux_set_strict(ctx, strict_mode);
 
     double load_time = timer_end();
     LOG_NORMAL(" done (%.1fs)\n", load_time);
@@ -609,6 +641,13 @@ int main(int argc, char *argv[]) {
     double total_time_final = (final_tv.tv_sec - total_start_tv.tv_sec) +
                               (final_tv.tv_usec - total_start_tv.tv_usec) / 1000000.0;
     LOG_NORMAL("Total generation time: %.1f seconds\n", load_time + total_time_final);
+
+    if (timing_output) {
+        printf("{\"event\":\"timing\",\"load_s\":%.6f,\"generate_s\":%.6f,\"end_to_end_s\":%.6f,\"width\":%d,\"height\":%d,\"steps\":%d,\"seed\":%lld}\n",
+               load_time, total_time, load_time + total_time_final,
+               output->width, output->height, params.num_steps,
+               (long long)actual_seed);
+    }
 
     /* Cleanup */
     flux_image_free(output);
