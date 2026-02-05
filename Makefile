@@ -2,7 +2,7 @@
 
 CC = gcc
 CUDA_HOME ?= /usr/local/cuda-13.0
-NVCC = $(CUDA_HOME)/bin/nvcc
+NVCC = $(if $(wildcard $(CUDA_HOME)/bin/nvcc),$(CUDA_HOME)/bin/nvcc,$(shell command -v nvcc 2>/dev/null))
 CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math -Iinclude/flux
 LDFLAGS = -lm
 CUDA_LIB_DIR = $(CUDA_HOME)/targets/x86_64-linux/lib
@@ -35,7 +35,7 @@ LIB = libflux.a
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address -Iinclude/flux
 SANITIZER_COMMON = -Wall -Wextra -O1 -g -fno-omit-frame-pointer -Iinclude/flux -DGENERIC_BUILD
 
-.PHONY: all clean debug lib install info test pngtest help generic blas mps golden-test asan ubsan cuda
+.PHONY: all clean debug lib install info test pngtest help generic blas mps golden-test asan ubsan cuda cuda-build cuda-check cuda-info
 
 all: help
 
@@ -48,6 +48,7 @@ help:
 	@echo "  make asan     - Build with Address+Undefined sanitizers (clang)"
 	@echo "  make ubsan    - Build with Undefined sanitizer (clang)"
 	@echo "  make cuda     - CUDA backend scaffold (CUDA 13.0)"
+	@echo "  make cuda-info - Show CUDA detection details"
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
 	@echo "  make mps      - Apple Silicon with Metal GPU (fastest)"
@@ -146,9 +147,15 @@ CUDA_CFLAGS = $(CFLAGS_BASE) -DUSE_CUDA -I$(CUDA_HOME)/include -Isrc/backends/cu
 CUDA_NVFLAGS = -O3 -DUSE_CUDA -Iinclude/flux -I$(CUDA_HOME)/include -Isrc/backends/cuda -Xcompiler "-Wall -Wextra"
 CUDA_LDFLAGS = -L$(CUDA_LIB_DIR) -lcudart -lcublas -lcublasLt -lm
 
-cuda: clean cuda-build
+cuda: cuda-check clean cuda-build
 	@echo ""
 	@echo "Built with CUDA backend scaffold (USE_CUDA)"
+
+cuda-check:
+	@if [ -z "$(NVCC)" ]; then \
+		echo "CUDA nvcc not found (set CUDA_HOME or install toolkit)"; \
+		exit 2; \
+	fi
 
 cuda-build: $(CUDA_C_OBJS) $(CUDA_OBJS)
 	$(NVCC) -o $(TARGET) $^ $(CUDA_LDFLAGS)
@@ -158,6 +165,15 @@ cuda-build: $(CUDA_C_OBJS) $(CUDA_OBJS)
 
 %.cuda.o: %.cu
 	$(NVCC) $(CUDA_NVFLAGS) -c -o $@ $<
+
+cuda-info:
+	@echo "CUDA_HOME: $(CUDA_HOME)"
+	@if [ -n "$(NVCC)" ]; then \
+		echo "NVCC path: $(NVCC)"; \
+		"$(NVCC)" --version; \
+	else \
+		echo "NVCC path: not found"; \
+	fi
 
 test:
 	@python3 run_test.py --flux-binary ./$(TARGET)
