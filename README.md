@@ -181,7 +181,19 @@ Done -> /tmp/flux-.../image-0003.png (ref $2)
 -m, --mmap            Memory-mapped weights (default, fastest on MPS)
     --no-mmap         Disable mmap, load all weights upfront
 -e, --embeddings PATH Load pre-computed text embeddings (advanced)
+    --strict          Fail if prompt embeddings are unavailable
 -h, --help            Show help
+```
+
+
+### Strict mode
+
+By default, if the Qwen3 text encoder cannot be loaded or prompt encoding fails, FLUX falls back to zero embeddings and prints a warning once per process.
+
+Use `--strict` to disable this fallback. In strict mode, generation exits nonzero with a clear error if embeddings are unavailable.
+
+```bash
+./flux -d flux-klein-model -p "a landscape" -o out.png --strict
 ```
 
 ## Reproducibility

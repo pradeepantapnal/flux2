@@ -111,6 +111,10 @@ struct flux_ctx {
 
     /* Memory mode */
     int use_mmap;  /* Use mmap for text encoder (lower memory, slower) */
+
+    /* Generation behavior */
+    int strict_mode;
+    int warned_missing_embeddings;
 };
 
 /* Global error message */
@@ -205,6 +209,10 @@ void flux_set_mmap(flux_ctx *ctx, int enable) {
     if (ctx) ctx->use_mmap = enable;
 }
 
+void flux_set_strict(flux_ctx *ctx, int enable) {
+    if (ctx) ctx->strict_mode = enable ? 1 : 0;
+}
+
 void flux_release_text_encoder(flux_ctx *ctx) {
     if (!ctx || !ctx->qwen3_encoder) return;
 
@@ -267,13 +275,21 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
         if (flux_phase_callback) flux_phase_callback("Loading Qwen3 encoder", 0);
         ctx->qwen3_encoder = qwen3_encoder_load(ctx->model_dir, ctx->use_mmap);
         if (flux_phase_callback) flux_phase_callback("Loading Qwen3 encoder", 1);
-        if (!ctx->qwen3_encoder) {
-            fprintf(stderr, "Warning: Failed to load Qwen3 text encoder\n");
+        if (!ctx->qwen3_encoder && ctx->strict_mode) {
+            set_error("Strict mode: failed to load Qwen3 text encoder");
         }
     }
 
     if (!ctx->qwen3_encoder) {
-        /* Return zero embeddings if encoder not available */
+        if (ctx->strict_mode) {
+            set_error("Strict mode: text embeddings unavailable (encoder missing)");
+            *out_seq_len = 0;
+            return NULL;
+        }
+        if (!ctx->warned_missing_embeddings) {
+            fprintf(stderr, "Warning: Qwen3 text encoder unavailable; using zero embeddings. Use --strict to fail instead.\n");
+            ctx->warned_missing_embeddings = 1;
+        }
         *out_seq_len = QWEN3_MAX_SEQ_LEN;
         return (float *)calloc(QWEN3_MAX_SEQ_LEN * QWEN3_TEXT_DIM, sizeof(float));
     }
@@ -283,8 +299,46 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
     float *embeddings = qwen3_encode_text(ctx->qwen3_encoder, prompt);
     if (flux_phase_callback) flux_phase_callback("encoding text", 1);
 
+    if (!embeddings) {
+        if (ctx->strict_mode) {
+            set_error("Strict mode: failed to encode prompt embeddings");
+            *out_seq_len = 0;
+            return NULL;
+        }
+        if (!ctx->warned_missing_embeddings) {
+            fprintf(stderr, "Warning: Prompt encoding failed; using zero embeddings. Use --strict to fail instead.\n");
+            ctx->warned_missing_embeddings = 1;
+        }
+        *out_seq_len = QWEN3_MAX_SEQ_LEN;
+        return (float *)calloc(QWEN3_MAX_SEQ_LEN * QWEN3_TEXT_DIM, sizeof(float));
+    }
+
     *out_seq_len = QWEN3_MAX_SEQ_LEN;  /* Always 512 */
     return embeddings;
+}
+
+static flux_params flux_normalize_params(const flux_params *params) {
+    flux_params p = params ? *params : (flux_params)FLUX_PARAMS_DEFAULT;
+
+    if (p.width <= 0) p.width = FLUX_DEFAULT_WIDTH;
+    if (p.height <= 0) p.height = FLUX_DEFAULT_HEIGHT;
+    if (p.num_steps <= 0) p.num_steps = 4;
+
+    p.width = (p.width / 16) * 16;
+    p.height = (p.height / 16) * 16;
+    if (p.width < 64) p.width = 64;
+    if (p.height < 64) p.height = 64;
+
+    return p;
+}
+
+static int flux_validate_params(flux_ctx *ctx, const flux_params *params) {
+    if (params->width > FLUX_VAE_MAX_DIM || params->height > FLUX_VAE_MAX_DIM) {
+        set_error("Image dimensions exceed maximum (1792x1792)");
+        return 0;
+    }
+    (void)ctx;
+    return 1;
 }
 
 /* ========================================================================
@@ -298,26 +352,8 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
         return NULL;
     }
 
-    /* Use defaults if params is NULL */
-    flux_params p;
-    if (params) {
-        p = *params;
-    } else {
-        p = (flux_params)FLUX_PARAMS_DEFAULT;
-    }
-
-    /* Validate dimensions */
-    if (p.width <= 0) p.width = FLUX_DEFAULT_WIDTH;
-    if (p.height <= 0) p.height = FLUX_DEFAULT_HEIGHT;
-    if (p.num_steps <= 0) p.num_steps = 4;  /* Klein default */
-
-    /* Ensure dimensions are divisible by 16 */
-    p.width = (p.width / 16) * 16;
-    p.height = (p.height / 16) * 16;
-    if (p.width < 64) p.width = 64;
-    if (p.height < 64) p.height = 64;
-    if (p.width > FLUX_VAE_MAX_DIM || p.height > FLUX_VAE_MAX_DIM) {
-        set_error("Image dimensions exceed maximum (1792x1792)");
+    flux_params p = flux_normalize_params(params);
+    if (!flux_validate_params(ctx, &p)) {
         return NULL;
     }
 
@@ -398,24 +434,8 @@ flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
         return NULL;
     }
 
-    flux_params p;
-    if (params) {
-        p = *params;
-    } else {
-        p = (flux_params)FLUX_PARAMS_DEFAULT;
-    }
-
-    /* Validate dimensions */
-    if (p.width <= 0) p.width = FLUX_DEFAULT_WIDTH;
-    if (p.height <= 0) p.height = FLUX_DEFAULT_HEIGHT;
-    if (p.num_steps <= 0) p.num_steps = 4;
-
-    p.width = (p.width / 16) * 16;
-    p.height = (p.height / 16) * 16;
-    if (p.width < 64) p.width = 64;
-    if (p.height < 64) p.height = 64;
-    if (p.width > FLUX_VAE_MAX_DIM || p.height > FLUX_VAE_MAX_DIM) {
-        set_error("Image dimensions exceed maximum (1792x1792)");
+    flux_params p = flux_normalize_params(params);
+    if (!flux_validate_params(ctx, &p)) {
         return NULL;
     }
 
@@ -479,24 +499,8 @@ flux_image *flux_generate_with_embeddings_and_noise(flux_ctx *ctx,
         return NULL;
     }
 
-    flux_params p;
-    if (params) {
-        p = *params;
-    } else {
-        p = (flux_params)FLUX_PARAMS_DEFAULT;
-    }
-
-    /* Validate dimensions */
-    if (p.width <= 0) p.width = FLUX_DEFAULT_WIDTH;
-    if (p.height <= 0) p.height = FLUX_DEFAULT_HEIGHT;
-    if (p.num_steps <= 0) p.num_steps = 4;
-
-    p.width = (p.width / 16) * 16;
-    p.height = (p.height / 16) * 16;
-    if (p.width < 64) p.width = 64;
-    if (p.height < 64) p.height = 64;
-    if (p.width > FLUX_VAE_MAX_DIM || p.height > FLUX_VAE_MAX_DIM) {
-        set_error("Image dimensions exceed maximum (1792x1792)");
+    flux_params p = flux_normalize_params(params);
+    if (!flux_validate_params(ctx, &p)) {
         return NULL;
     }
 
