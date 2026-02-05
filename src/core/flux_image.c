@@ -977,3 +977,37 @@ flux_image *flux_image_convert(const flux_image *img, int new_channels) {
 #ifdef _WIN32
 #define strcasecmp _stricmp
 #endif
+
+
+/* ========================================================================
+ * Finalized status-based API wrappers
+ * ======================================================================== */
+
+flux_status_t flux_image_load_status(flux_ctx *ctx, const char *path, flux_image **out_image) {
+    (void)ctx;
+    if (!path || !out_image) return FLUX_STATUS_INVALID_ARGUMENT;
+    *out_image = flux_image_load(path);
+    return *out_image ? FLUX_STATUS_OK : FLUX_STATUS_IO_ERROR;
+}
+
+flux_status_t flux_image_save_status(flux_ctx *ctx, const flux_image *img, const char *path) {
+    (void)ctx;
+    if (!img || !path) return FLUX_STATUS_INVALID_ARGUMENT;
+    return flux_image_save(img, path) == 0 ? FLUX_STATUS_OK : FLUX_STATUS_IO_ERROR;
+}
+
+flux_status_t flux_image_save_with_seed_status(flux_ctx *ctx, const flux_image *img,
+                                               const char *path, int64_t seed) {
+    (void)ctx;
+    if (!img || !path) return FLUX_STATUS_INVALID_ARGUMENT;
+    return flux_image_save_with_seed(img, path, seed) == 0 ? FLUX_STATUS_OK : FLUX_STATUS_IO_ERROR;
+}
+
+flux_status_t flux_image_resize_status(flux_ctx *ctx, const flux_image *img,
+                                       int new_width, int new_height,
+                                       flux_image **out_image) {
+    (void)ctx;
+    if (!img || !out_image || new_width <= 0 || new_height <= 0) return FLUX_STATUS_INVALID_ARGUMENT;
+    *out_image = flux_image_resize(img, new_width, new_height);
+    return *out_image ? FLUX_STATUS_OK : FLUX_STATUS_RUNTIME_ERROR;
+}

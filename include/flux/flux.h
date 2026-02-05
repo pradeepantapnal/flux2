@@ -21,6 +21,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -96,6 +97,16 @@ typedef struct {
 /* ========================================================================
  * Core API
  * ======================================================================== */
+
+
+/* Status codes for all public API entry points. */
+typedef enum {
+    FLUX_STATUS_OK = 0,
+    FLUX_STATUS_INVALID_ARGUMENT = 1,
+    FLUX_STATUS_IO_ERROR = 2,
+    FLUX_STATUS_OUT_OF_MEMORY = 3,
+    FLUX_STATUS_RUNTIME_ERROR = 4
+} flux_status_t;
 
 /*
  * Load model from HuggingFace-style directory containing safetensors files.
@@ -279,6 +290,44 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len);
 float *flux_denoise_step(flux_ctx *ctx, const float *z, float t,
                          const float *text_emb, int text_len,
                          int latent_h, int latent_w);
+
+
+/* ========================================================================
+ * Finalized status-based API (preferred)
+ * ======================================================================== */
+
+flux_status_t flux_ctx_load(flux_ctx **out_ctx, const char *model_dir);
+flux_status_t flux_ctx_free(flux_ctx *ctx);
+flux_status_t flux_ctx_release_text_encoder(flux_ctx *ctx);
+flux_status_t flux_ctx_set_mmap(flux_ctx *ctx, int enable);
+flux_status_t flux_ctx_set_strict(flux_ctx *ctx, int enable);
+flux_status_t flux_ctx_set_embed_cache(flux_ctx *ctx, int enable);
+
+flux_status_t flux_generate_status(flux_ctx *ctx, const char *prompt,
+                                   const flux_params *params, flux_image **out_image);
+flux_status_t flux_img2img_status(flux_ctx *ctx, const char *prompt,
+                                  const flux_image *input, const flux_params *params,
+                                  flux_image **out_image);
+flux_status_t flux_multiref_status(flux_ctx *ctx, const char *prompt,
+                                   const flux_image **refs, int num_refs,
+                                   const flux_params *params, flux_image **out_image);
+flux_status_t flux_generate_with_embeddings_status(flux_ctx *ctx,
+                                                   const float *text_emb, int text_seq,
+                                                   const flux_params *params,
+                                                   flux_image **out_image);
+flux_status_t flux_generate_with_embeddings_and_noise_status(flux_ctx *ctx,
+                                                             const float *text_emb, int text_seq,
+                                                             const float *noise, int noise_size,
+                                                             const flux_params *params,
+                                                             flux_image **out_image);
+
+flux_status_t flux_image_load_status(flux_ctx *ctx, const char *path, flux_image **out_image);
+flux_status_t flux_image_save_status(flux_ctx *ctx, const flux_image *img, const char *path);
+flux_status_t flux_image_save_with_seed_status(flux_ctx *ctx, const flux_image *img,
+                                               const char *path, int64_t seed);
+flux_status_t flux_image_resize_status(flux_ctx *ctx, const flux_image *img,
+                                       int new_width, int new_height,
+                                       flux_image **out_image);
 
 #ifdef __cplusplus
 }

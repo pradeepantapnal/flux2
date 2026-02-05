@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Benchmark harness for the FLUX CLI.
 
-Runs ./flux multiple times, parses machine-readable timing JSON from stdout
-(produced by --timing), and emits aggregate stats as JSON.
+Runs ./flux multiple times, requests machine-readable timing JSON via
+`--timing --json-out <file>`, and emits aggregate stats as JSON.
 """
 
 from __future__ import annotations
@@ -42,8 +42,8 @@ def summarize(values: list[float]) -> dict[str, float]:
     }
 
 
-def parse_timing_json(stdout: str) -> dict | None:
-    for line in stdout.splitlines():
+def parse_timing_json(text: str) -> dict | None:
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -52,7 +52,7 @@ def parse_timing_json(stdout: str) -> dict | None:
     return None
 
 
-def build_command(args: argparse.Namespace, out_path: str) -> list[str]:
+def build_command(args: argparse.Namespace, out_path: str, timing_json_path: str) -> list[str]:
     cmd = [
         args.flux_binary,
         "-d",
@@ -70,6 +70,8 @@ def build_command(args: argparse.Namespace, out_path: str) -> list[str]:
         "-S",
         str(args.seed),
         "--timing",
+        "--json-out",
+        timing_json_path,
     ]
     if args.mmap:
         cmd.append("--mmap")
@@ -82,7 +84,8 @@ def build_command(args: argparse.Namespace, out_path: str) -> list[str]:
 
 def run_once(args: argparse.Namespace, run_idx: int) -> dict:
     out_path = str(Path(args.output_dir) / f"bench_{run_idx:04d}.png")
-    cmd = build_command(args, out_path)
+    timing_json_path = str(Path(args.output_dir) / f"bench_{run_idx:04d}.timing.json")
+    cmd = build_command(args, out_path, timing_json_path)
 
     wall_start = time.perf_counter()
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -94,11 +97,16 @@ def run_once(args: argparse.Namespace, run_idx: int) -> dict:
             f"CMD: {' '.join(cmd)}\nSTDERR:\n{proc.stderr}\nSTDOUT:\n{proc.stdout}"
         )
 
-    timing = parse_timing_json(proc.stdout)
+    timing = None
+    timing_file = Path(timing_json_path)
+    if timing_file.exists():
+        timing = parse_timing_json(timing_file.read_text(encoding="utf-8"))
+    if timing is None:
+        timing = parse_timing_json(proc.stdout)
     if timing is None:
         raise RuntimeError(
-            "Missing timing JSON from flux stdout. Ensure binary supports --timing.\n"
-            f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+            "Missing timing JSON from flux output. Ensure binary supports --timing and --json-out.\n"
+            f"TIMING_FILE: {timing_json_path}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
         )
 
     timing["wall_s"] = wall_s

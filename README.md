@@ -398,6 +398,8 @@ This reduces peak memory from ~16GB to ~4-5GB, making inference possible on 16GB
 
 The library can be integrated into your own C/C++ projects. Link against `libflux.a` and include `flux.h`.
 
+> Public API note: the finalized API is status-based (`flux_status_t`) and context-centric (`flux_ctx *`).
+
 ### Text-to-Image Generation
 
 Here's a complete program that generates an image from a text prompt:
@@ -530,31 +532,39 @@ if (!ctx) {
 
 ### API Reference
 
-**Core functions:**
+**Core context lifecycle (status-based):**
 ```c
-flux_ctx *flux_load_dir(const char *model_dir);   /* Load model, returns NULL on error */
-void flux_free(flux_ctx *ctx);                     /* Free all resources */
-
-flux_image *flux_generate(flux_ctx *ctx, const char *prompt, const flux_params *params);
-flux_image *flux_img2img(flux_ctx *ctx, const char *prompt, const flux_image *input,
-                          const flux_params *params);
+flux_status_t flux_ctx_load(flux_ctx **out_ctx, const char *model_dir);
+flux_status_t flux_ctx_free(flux_ctx *ctx);
+flux_status_t flux_ctx_set_mmap(flux_ctx *ctx, int enable);
+flux_status_t flux_ctx_set_strict(flux_ctx *ctx, int enable);
+flux_status_t flux_ctx_set_embed_cache(flux_ctx *ctx, int enable);
 ```
 
-**Image handling:**
+**Generation (status-based):**
 ```c
-flux_image *flux_image_load(const char *path);     /* Load PNG or PPM */
-int flux_image_save(const flux_image *img, const char *path);  /* 0=success, -1=error */
-int flux_image_save_with_seed(const flux_image *img, const char *path, int64_t seed);  /* Save with metadata */
-flux_image *flux_image_resize(const flux_image *img, int new_w, int new_h);
+flux_status_t flux_generate_status(flux_ctx *ctx, const char *prompt,
+                                   const flux_params *params, flux_image **out_image);
+flux_status_t flux_img2img_status(flux_ctx *ctx, const char *prompt,
+                                  const flux_image *input, const flux_params *params,
+                                  flux_image **out_image);
+flux_status_t flux_multiref_status(flux_ctx *ctx, const char *prompt,
+                                   const flux_image **refs, int num_refs,
+                                   const flux_params *params, flux_image **out_image);
+```
+
+**Image I/O (status-based):**
+```c
+flux_status_t flux_image_load_status(flux_ctx *ctx, const char *path, flux_image **out_image);
+flux_status_t flux_image_save_status(flux_ctx *ctx, const flux_image *img, const char *path);
+flux_status_t flux_image_save_with_seed_status(flux_ctx *ctx, const flux_image *img,
+                                               const char *path, int64_t seed);
+flux_status_t flux_image_resize_status(flux_ctx *ctx, const flux_image *img,
+                                       int new_w, int new_h, flux_image **out_image);
 void flux_image_free(flux_image *img);
 ```
 
-**Utilities:**
-```c
-void flux_set_seed(int64_t seed);                  /* Set RNG seed for reproducibility */
-const char *flux_get_error(void);                  /* Get last error message */
-void flux_release_text_encoder(flux_ctx *ctx);     /* Manually free ~8GB (optional) */
-```
+**Compatibility:** legacy pointer-return APIs remain for transition, but new integrations should use `flux_status_t` APIs.
 
 ### Parameters
 

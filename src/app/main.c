@@ -30,6 +30,7 @@
 #include <getopt.h>
 #include <time.h>
 #include <sys/time.h>
+#include <stdint.h>
 
 #ifdef USE_METAL
 #include "flux_metal.h"
@@ -199,7 +200,54 @@ static double timer_end(void) {
 #define DEFAULT_WIDTH 256
 #define DEFAULT_HEIGHT 256
 #define DEFAULT_STEPS 4
+#define DETERMINISTIC_DEFAULT_SEED 777
 #define MAX_INPUT_IMAGES 16
+
+static int write_smoke_output(const char *output_path, int width, int height, int64_t seed) {
+    FILE *f = fopen(output_path, "wb");
+    if (!f) return -1;
+
+    const int w = (width > 0) ? width : 64;
+    const int h = (height > 0) ? height : 64;
+    if (fprintf(f, "P6\n%d %d\n255\n", w, h) < 0) {
+        fclose(f);
+        return -1;
+    }
+
+    uint64_t state = (uint64_t)seed ^ 0x9e3779b97f4a7c15ULL;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            state = state * 6364136223846793005ULL + 1ULL;
+            unsigned char r = (unsigned char)((state >> 24) & 0xFF);
+            state ^= (uint64_t)(x * 1315423911u + y * 2654435761u);
+            unsigned char g = (unsigned char)((state >> 16) & 0xFF);
+            state = state * 2862933555777941757ULL + 3037000493ULL;
+            unsigned char b = (unsigned char)((state >> 32) & 0xFF);
+            fputc(r, f);
+            fputc(g, f);
+            fputc(b, f);
+        }
+    }
+
+    return fclose(f);
+}
+
+
+static void emit_timing_json(FILE *out,
+                             double load_s,
+                             double generate_s,
+                             double save_s,
+                             double end_to_end_s,
+                             int width,
+                             int height,
+                             int steps,
+                             long long seed) {
+    fprintf(out,
+            "{\"event\":\"timing\",\"schema\":\"flux_timing_v1\",\"stages\":[{\"label\":\"load_model\",\"seconds\":%.6f},{\"label\":\"generate\",\"seconds\":%.6f},{\"label\":\"save_output\",\"seconds\":%.6f},{\"label\":\"end_to_end\",\"seconds\":%.6f}],\"load_s\":%.6f,\"generate_s\":%.6f,\"save_s\":%.6f,\"end_to_end_s\":%.6f,\"width\":%d,\"height\":%d,\"steps\":%d,\"seed\":%lld}\n",
+            load_s, generate_s, save_s, end_to_end_s,
+            load_s, generate_s, save_s, end_to_end_s,
+            width, height, steps, seed);
+}
 
 static void print_usage(const char *prog) {
     fprintf(stderr, "FLUX.2 klein 4B - Pure C Image Generation\n\n");
@@ -224,6 +272,8 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "Other options:\n");
     fprintf(stderr, "      --smoke, --no-weights\n                        Run no-weights smoke check and exit\n");
     fprintf(stderr, "      --timing          Print machine-readable JSON timing summary to stdout\n");
+    fprintf(stderr, "      --json-out PATH   Write timing JSON to file (requires --timing)\n");
+    fprintf(stderr, "      --deterministic   Force deterministic behavior and print banner\n");
     fprintf(stderr, "      --strict          Fail if prompt embeddings are unavailable\n");
     fprintf(stderr, "      --no-embed-cache Disable prompt embedding cache\n");
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
@@ -272,6 +322,8 @@ int main(int argc, char *argv[]) {
         {"smoke",      no_argument,       0, 'x'},
         {"no-weights", no_argument,       0, 'x'},
         {"timing",     no_argument,       0, 't'},
+        {"json-out",   required_argument, 0, 'j'},
+        {"deterministic", no_argument,    0, 'D'},
         {"strict",     no_argument,       0, 'r'},
         {"no-embed-cache", no_argument,   0, 1000},
         {0, 0, 0, 0}
@@ -299,12 +351,14 @@ int main(int argc, char *argv[]) {
     int show_steps = 0;
     int smoke_mode = 0;
     int timing_output = 0;
+    char *timing_json_out = NULL;
     int strict_mode = 0;
+    int deterministic_mode = 0;
     int embed_cache_enabled = 1;
     term_graphics_proto graphics_proto = detect_terminal_graphics();
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:S:i:e:n:qvhVmMkKtxr",
+    while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:S:i:e:n:qvhVmMkKtxrDj:",
                               long_options, NULL)) != -1) {
         switch (opt) {
             case 'd': model_dir = optarg; break;
@@ -335,12 +389,19 @@ int main(int argc, char *argv[]) {
             case 'K': show_steps = 1; break;
             case 'x': smoke_mode = 1; break;
             case 't': timing_output = 1; break;
+            case 'j': timing_json_out = optarg; break;
+            case 'D': deterministic_mode = 1; break;
             case 'r': strict_mode = 1; break;
             case 1000: embed_cache_enabled = 0; break;
             default:
                 print_usage(argv[0]);
                 return 1;
         }
+    }
+
+    if (deterministic_mode) {
+        fprintf(stderr, "[deterministic] mode enabled: fixed seed + stable smoke output\n");
+        use_mmap = 0;
     }
 
     if (smoke_mode) {
@@ -357,6 +418,42 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Error: Steps must be between 1 and %d\n", FLUX_MAX_STEPS);
             return 1;
         }
+        if (deterministic_mode && params.seed < 0) {
+            params.seed = DETERMINISTIC_DEFAULT_SEED;
+        }
+
+        int64_t smoke_seed = (params.seed >= 0) ? params.seed : DETERMINISTIC_DEFAULT_SEED;
+        if (output_path) {
+            if (write_smoke_output(output_path, params.width, params.height, smoke_seed) != 0) {
+                fprintf(stderr, "Error: Failed to write smoke output: %s\n", output_path);
+                return 1;
+            }
+        }
+
+        if (timing_json_out && !timing_output) {
+            fprintf(stderr, "Warning: --json-out has no effect without --timing\n");
+        }
+
+        if (timing_output) {
+            emit_timing_json(stdout,
+                             0.0, 0.0, 0.0, 0.0,
+                             params.width, params.height, params.num_steps,
+                             (long long)smoke_seed);
+
+            if (timing_json_out) {
+                FILE *timing_file = fopen(timing_json_out, "w");
+                if (!timing_file) {
+                    fprintf(stderr, "Warning: Failed to open timing output file: %s\n", timing_json_out);
+                } else {
+                    emit_timing_json(timing_file,
+                                     0.0, 0.0, 0.0, 0.0,
+                                     params.width, params.height, params.num_steps,
+                                     (long long)smoke_seed);
+                    fclose(timing_file);
+                }
+            }
+        }
+
         printf("SMOKE OK\n");
         return 0;
     }
@@ -400,6 +497,10 @@ int main(int argc, char *argv[]) {
 
     /* Set seed */
     int64_t actual_seed;
+    if (deterministic_mode && params.seed < 0) {
+        params.seed = DETERMINISTIC_DEFAULT_SEED;
+    }
+
     if (params.seed >= 0) {
         actual_seed = params.seed;
     } else {
@@ -429,8 +530,8 @@ int main(int argc, char *argv[]) {
     if (output_level >= OUTPUT_NORMAL) fflush(stderr);
     timer_begin();
 
-    flux_ctx *ctx = flux_load_dir(model_dir);
-    if (!ctx) {
+    flux_ctx *ctx = NULL;
+    if (flux_ctx_load(&ctx, model_dir) != FLUX_STATUS_OK) {
         fprintf(stderr, "\nError: Failed to load model: %s\n", flux_get_error());
         return 1;
     }
@@ -450,7 +551,7 @@ int main(int argc, char *argv[]) {
     /* Interactive mode: start REPL */
     if (interactive_mode) {
         int rc = flux_cli_run(ctx, model_dir);
-        flux_free(ctx);
+        flux_ctx_free(ctx);
         return rc;
     }
 
@@ -482,11 +583,10 @@ int main(int argc, char *argv[]) {
 
         flux_image *inputs[MAX_INPUT_IMAGES];
         for (int i = 0; i < num_inputs; i++) {
-            inputs[i] = flux_image_load(input_paths[i]);
-            if (!inputs[i]) {
+            if (flux_image_load_status(ctx, input_paths[i], &inputs[i]) != FLUX_STATUS_OK) {
                 fprintf(stderr, "\nError: Failed to load input image: %s\n", input_paths[i]);
                 for (int j = 0; j < i; j++) flux_image_free(inputs[j]);
-                flux_free(ctx);
+                flux_ctx_free(ctx);
                 return 1;
             }
         }
@@ -502,7 +602,9 @@ int main(int argc, char *argv[]) {
         if (!height_set) params.height = inputs[0]->height;
 
         /* Generate with multi-reference */
-        output = flux_multiref(ctx, prompt, (const flux_image **)inputs, num_inputs, &params);
+        if (flux_multiref_status(ctx, prompt, (const flux_image **)inputs, num_inputs, &params, &output) != FLUX_STATUS_OK) {
+            output = NULL;
+        }
 
         for (int i = 0; i < num_inputs; i++) {
             flux_image_free(inputs[i]);
@@ -517,7 +619,7 @@ int main(int argc, char *argv[]) {
         FILE *emb_file = fopen(embeddings_path, "rb");
         if (!emb_file) {
             fprintf(stderr, "\nError: Failed to open embeddings file: %s\n", embeddings_path);
-            flux_free(ctx);
+            flux_ctx_free(ctx);
             return 1;
         }
 
@@ -533,7 +635,7 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "\nError: Failed to read embeddings file\n");
             free(text_emb);
             fclose(emb_file);
-            flux_free(ctx);
+            flux_ctx_free(ctx);
             return 1;
         }
         fclose(emb_file);
@@ -552,7 +654,7 @@ int main(int argc, char *argv[]) {
             if (!noise_file) {
                 fprintf(stderr, "Error: Failed to open noise file: %s\n", noise_path);
                 free(text_emb);
-                flux_free(ctx);
+                flux_ctx_free(ctx);
                 return 1;
             }
 
@@ -567,7 +669,7 @@ int main(int argc, char *argv[]) {
                 free(noise);
                 free(text_emb);
                 fclose(noise_file);
-                flux_free(ctx);
+                flux_ctx_free(ctx);
                 return 1;
             }
             fclose(noise_file);
@@ -576,11 +678,15 @@ int main(int argc, char *argv[]) {
 
         /* Generate */
         if (noise) {
-            output = flux_generate_with_embeddings_and_noise(ctx, text_emb, text_seq,
-                                                              noise, noise_size, &params);
+            if (flux_generate_with_embeddings_and_noise_status(ctx, text_emb, text_seq,
+                                                                noise, noise_size, &params, &output) != FLUX_STATUS_OK) {
+                output = NULL;
+            }
             free(noise);
         } else {
-            output = flux_generate_with_embeddings(ctx, text_emb, text_seq, &params);
+            if (flux_generate_with_embeddings_status(ctx, text_emb, text_seq, &params, &output) != FLUX_STATUS_OK) {
+                output = NULL;
+            }
         }
         free(text_emb);
 
@@ -589,7 +695,9 @@ int main(int argc, char *argv[]) {
         /* Note: flux_generate handles text encoding internally.
          * We can't easily time it separately without modifying the library.
          * The progress callbacks will show denoising progress. */
-        output = flux_generate(ctx, prompt, &params);
+        if (flux_generate_status(ctx, prompt, &params, &output) != FLUX_STATUS_OK) {
+            output = NULL;
+        }
     }
 
     /* Finish progress display */
@@ -602,7 +710,7 @@ int main(int argc, char *argv[]) {
 
     if (!output) {
         fprintf(stderr, "Error: Generation failed: %s\n", flux_get_error());
-        flux_free(ctx);
+        flux_ctx_free(ctx);
         return 1;
     }
 
@@ -619,14 +727,15 @@ int main(int argc, char *argv[]) {
     if (output_level >= OUTPUT_NORMAL) fflush(stderr);
     timer_begin();
 
-    if (flux_image_save_with_seed(output, output_path, actual_seed) != 0) {
+    if (flux_image_save_with_seed_status(ctx, output, output_path, actual_seed) != FLUX_STATUS_OK) {
         fprintf(stderr, "\nError: Failed to save image: %s\n", output_path);
         flux_image_free(output);
-        flux_free(ctx);
+        flux_ctx_free(ctx);
         return 1;
     }
 
-    LOG_NORMAL(" %s %dx%d (%.1fs)\n", output_path, output->width, output->height, timer_end());
+    double save_time = timer_end();
+    LOG_NORMAL(" %s %dx%d (%.1fs)\n", output_path, output->width, output->height, save_time);
 
     /* Display image in terminal if requested */
     if (show_image) {
@@ -640,16 +749,33 @@ int main(int argc, char *argv[]) {
                               (final_tv.tv_usec - total_start_tv.tv_usec) / 1000000.0;
     LOG_NORMAL("Total generation time: %.1f seconds\n", load_time + total_time_final);
 
+    if (timing_json_out && !timing_output) {
+        fprintf(stderr, "Warning: --json-out has no effect without --timing\n");
+    }
+
     if (timing_output) {
-        printf("{\"event\":\"timing\",\"load_s\":%.6f,\"generate_s\":%.6f,\"end_to_end_s\":%.6f,\"width\":%d,\"height\":%d,\"steps\":%d,\"seed\":%lld}\n",
-               load_time, total_time, load_time + total_time_final,
-               output->width, output->height, params.num_steps,
-               (long long)actual_seed);
+        emit_timing_json(stdout,
+                         load_time, total_time, save_time, load_time + total_time_final,
+                         output->width, output->height, params.num_steps,
+                         (long long)actual_seed);
+
+        if (timing_json_out) {
+            FILE *timing_file = fopen(timing_json_out, "w");
+            if (!timing_file) {
+                fprintf(stderr, "Warning: Failed to open timing output file: %s\n", timing_json_out);
+            } else {
+                emit_timing_json(timing_file,
+                                 load_time, total_time, save_time, load_time + total_time_final,
+                                 output->width, output->height, params.num_steps,
+                                 (long long)actual_seed);
+                fclose(timing_file);
+            }
+        }
     }
 
     /* Cleanup */
     flux_image_free(output);
-    flux_free(ctx);
+    flux_ctx_free(ctx);
 
 #ifdef USE_METAL
     flux_metal_cleanup();
