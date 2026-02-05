@@ -422,6 +422,34 @@ void safetensor_print(const safetensor_t *t) {
     printf("], offset=%zu, size=%zu\n", t->data_offset, t->data_size);
 }
 
+
+int safetensors_prefault_tensor_pages(const safetensors_file_t *sf) {
+    if (!sf || !sf->data || sf->file_size == 0) return 0;
+
+    const size_t page_size = 4096;
+    const volatile unsigned char *base = (const volatile unsigned char *)sf->data;
+    volatile unsigned char sink = 0;
+
+    for (int i = 0; i < sf->num_tensors; i++) {
+        const safetensor_t *t = &sf->tensors[i];
+        size_t start = 8 + sf->header_size + t->data_offset;
+        size_t size = t->data_size;
+        if (size == 0) continue;
+        if (start >= sf->file_size) continue;
+
+        size_t end = start + size;
+        if (end > sf->file_size) end = sf->file_size;
+
+        for (size_t off = start; off < end; off += page_size) {
+            sink ^= base[off];
+        }
+        sink ^= base[end - 1];
+    }
+
+    (void)sink;
+    return 1;
+}
+
 void safetensors_print_all(const safetensors_file_t *sf) {
     printf("Safetensors file: %s\n", sf->path);
     printf("File size: %zu bytes\n", sf->file_size);

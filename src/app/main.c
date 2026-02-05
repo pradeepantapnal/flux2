@@ -394,6 +394,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
     fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default, fastest on MPS)\n");
     fprintf(stderr, "      --no-mmap         Disable mmap, load all weights upfront\n");
+    fprintf(stderr, "      --no-mmap-force   Override resident memory safety limit for --no-mmap\n");
     fprintf(stderr, "      --preload         Preload transformer before denoising (prefault mmap pages)\n");
     fprintf(stderr, "  -h, --help            Show this help\n\n");
     fprintf(stderr, "Examples:\n");
@@ -433,6 +434,7 @@ int main(int argc, char *argv[]) {
         {"version",    no_argument,       0, 'V'},
         {"mmap",       no_argument,       0, 'm'},
         {"no-mmap",    no_argument,       0, 'M'},
+        {"no-mmap-force", no_argument,   0, 1002},
         {"preload",   no_argument,       0, 'P'},
         {"show",       no_argument,       0, 'k'},
         {"show-steps", no_argument,       0, 'K'},
@@ -475,6 +477,7 @@ int main(int argc, char *argv[]) {
     int embed_cache_enabled = 1;
     char *embcache_dir = NULL;
     int preload_transformer = 0;
+    int no_mmap_force = 0;
     term_graphics_proto graphics_proto = detect_terminal_graphics();
 
     int opt;
@@ -506,6 +509,7 @@ int main(int argc, char *argv[]) {
             case 'm': use_mmap = 1; break;
             case 'M': use_mmap = 0; break;
             case 'P': preload_transformer = 1; break;
+            case 1002: no_mmap_force = 1; break;
             case 'k': show_image = 1; break;
             case 'K': show_steps = 1; break;
             case 'x': smoke_mode = 1; break;
@@ -668,6 +672,7 @@ int main(int argc, char *argv[]) {
         flux_set_mmap(ctx, 1);
         LOG_VERBOSE("  Using mmap mode for text encoder (lower memory)\n");
     }
+    flux_set_no_mmap_force(ctx, no_mmap_force);
     flux_set_strict(ctx, strict_mode);
     flux_set_embed_cache(ctx, embed_cache_enabled);
     if (embcache_dir && embcache_dir[0]) {

@@ -84,4 +84,8 @@ void safetensor_print(const safetensor_t *t);
 /* Print all tensors in file */
 void safetensors_print_all(const safetensors_file_t *sf);
 
+/* Touch one byte per OS page for every tensor region to prefault mmap pages.
+ * Returns 1 on success, 0 on invalid input. */
+int safetensors_prefault_tensor_pages(const safetensors_file_t *sf);
+
 #endif /* FLUX_SAFETENSORS_H */
