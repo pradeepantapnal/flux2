@@ -16,6 +16,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <errno.h>
 
 #ifdef USE_METAL
 #include "flux_metal.h"
@@ -46,10 +47,13 @@ extern float *flux_image_to_tensor(const flux_image *img);
 extern flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf);
 extern flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *sf);
 extern void flux_transformer_free(flux_transformer_t *tf);
+extern void flux_transformer_set_runtime_diag(int enable);
+extern int flux_transformer_prefault_mmap(flux_transformer_t *tf);
 extern float *flux_transformer_forward(flux_transformer_t *tf,
                                         const float *img_latent, int img_h, int img_w,
                                         const float *txt_emb, int txt_seq,
                                         float timestep);
+extern void flux_qwen3_set_runtime_diag(int enable);
 
 extern float *flux_sample_euler(void *transformer, void *text_encoder,
                                 float *z, int batch, int channels, int h, int w,
@@ -123,9 +127,25 @@ struct flux_ctx {
     int embed_cache_enabled;
     int last_embed_cache_hit;
     int last_embed_cache_known;
+    uint64_t last_embed_prompt_hash;
+    uint64_t last_embed_tokenizer_hash;
+    uint64_t last_embed_revision_hash;
+    int runtime_diagnostics;
+    char embed_cache_dir[512];
     char tokenizer_config_id[80];
     char model_revision_id[80];
 };
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t seq_len;
+    uint32_t dim;
+    uint64_t payload_checksum;
+} embdisk_header_t;
+
+#define EMBDISK_MAGIC 0x454D4243u /* "EMBC" */
+#define EMBDISK_VERSION 1u
 
 /* Global error message */
 static char g_error_msg[256] = {0};
@@ -151,30 +171,6 @@ static void set_error(const char *msg) {
 static int file_exists(const char *path) {
     struct stat st;
     return stat(path, &st) == 0;
-}
-
-
-static int prefault_transformer_mmap_pages(const char *model_dir) {
-    char path[1024];
-    snprintf(path, sizeof(path), "%s/transformer/diffusion_pytorch_model.safetensors", model_dir);
-
-    safetensors_file_t *sf = safetensors_open(path);
-    if (!sf || !sf->data || sf->file_size == 0) {
-        if (sf) safetensors_close(sf);
-        return 0;
-    }
-
-    const size_t page_size = 4096;
-    const volatile unsigned char *bytes = (const volatile unsigned char *)sf->data;
-    volatile unsigned char sink = 0;
-    for (size_t off = 0; off < sf->file_size; off += page_size) {
-        sink ^= bytes[off];
-    }
-    sink ^= bytes[sf->file_size - 1];
-    (void)sink;
-
-    safetensors_close(sf);
-    return 1;
 }
 
 
@@ -204,6 +200,99 @@ static uint64_t hash_file_contents(const char *path) {
     }
     fclose(f);
     return h;
+}
+
+static int ensure_dir_exists(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        return S_ISDIR(st.st_mode) ? 1 : 0;
+    }
+    if (mkdir(path, 0755) == 0) return 1;
+    return errno == EEXIST;
+}
+
+static const char *ctx_dtype_policy(const flux_ctx *ctx) {
+#ifdef USE_METAL
+    return ctx->use_mmap ? "qwen3=bf16(on-demand),transformer=bf16" : "qwen3=bf16(resident),transformer=bf16";
+#elif defined(USE_BLAS)
+    return ctx->use_mmap ? "qwen3=bf16->fp32(on-demand),transformer=fp32" : "qwen3=fp32(resident),transformer=fp32";
+#else
+    return ctx->use_mmap ? "qwen3=bf16->fp32(on-demand),transformer=fp32" : "qwen3=fp32(resident),transformer=fp32";
+#endif
+}
+
+static uint64_t embdisk_key_hash(const flux_ctx *ctx, const char *prompt) {
+    const uint64_t ph = fnv1a_bytes((const unsigned char *)prompt, strlen(prompt));
+    const uint64_t th = fnv1a_bytes((const unsigned char *)ctx->tokenizer_config_id, strlen(ctx->tokenizer_config_id));
+    const uint64_t rh = fnv1a_bytes((const unsigned char *)ctx->model_revision_id, strlen(ctx->model_revision_id));
+    const uint64_t dh = fnv1a_bytes((const unsigned char *)ctx_dtype_policy(ctx), strlen(ctx_dtype_policy(ctx)));
+    char keybuf[512];
+    snprintf(keybuf, sizeof(keybuf),
+             "rev=%016llx|tok=%016llx|prompt=%016llx|maxlen=%d|dtype=%016llx",
+             (unsigned long long)rh,
+             (unsigned long long)th,
+             (unsigned long long)ph,
+             QWEN3_MAX_SEQ_LEN,
+             (unsigned long long)dh);
+    return fnv1a_bytes((const unsigned char *)keybuf, strlen(keybuf));
+}
+
+static int embdisk_load(flux_ctx *ctx, const char *prompt, float **out_embedding, int *out_seq_len) {
+    if (!ctx->embed_cache_dir[0]) return 0;
+    uint64_t key = embdisk_key_hash(ctx, prompt);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%016llx.emb", ctx->embed_cache_dir, (unsigned long long)key);
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+
+    embdisk_header_t hdr;
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1 || hdr.magic != EMBDISK_MAGIC || hdr.version != EMBDISK_VERSION) {
+        fclose(f);
+        return 0;
+    }
+    if (hdr.seq_len == 0 || hdr.dim != (uint32_t)QWEN3_TEXT_DIM || hdr.seq_len > (uint32_t)QWEN3_MAX_SEQ_LEN) {
+        fclose(f);
+        return 0;
+    }
+
+    size_t n = (size_t)hdr.seq_len * hdr.dim;
+    float *emb = (float *)malloc(n * sizeof(float));
+    if (!emb) { fclose(f); return 0; }
+    if (fread(emb, sizeof(float), n, f) != n) { free(emb); fclose(f); return 0; }
+    fclose(f);
+
+    uint64_t chk = fnv1a_bytes((const unsigned char *)emb, n * sizeof(float));
+    if (chk != hdr.payload_checksum) { free(emb); return 0; }
+
+    *out_embedding = emb;
+    *out_seq_len = (int)hdr.seq_len;
+    return 1;
+}
+
+static void embdisk_store(flux_ctx *ctx, const char *prompt, const float *embedding, int seq_len, int dim) {
+    if (!ctx->embed_cache_dir[0] || !embedding || seq_len <= 0 || dim <= 0) return;
+    if (!ensure_dir_exists(ctx->embed_cache_dir)) return;
+
+    uint64_t key = embdisk_key_hash(ctx, prompt);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%016llx.emb", ctx->embed_cache_dir, (unsigned long long)key);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+
+    size_t n = (size_t)seq_len * dim;
+    embdisk_header_t hdr;
+    hdr.magic = EMBDISK_MAGIC;
+    hdr.version = EMBDISK_VERSION;
+    hdr.seq_len = (uint32_t)seq_len;
+    hdr.dim = (uint32_t)dim;
+    hdr.payload_checksum = fnv1a_bytes((const unsigned char *)embedding, n * sizeof(float));
+
+    if (fwrite(&hdr, sizeof(hdr), 1, f) != 1 || fwrite(embedding, sizeof(float), n, f) != n) {
+        fclose(f);
+        unlink(path);
+        return;
+    }
+    fclose(f);
 }
 
 static void init_model_ids(flux_ctx *ctx, const char *model_dir) {
@@ -328,6 +417,23 @@ void flux_set_embed_cache(flux_ctx *ctx, int enable) {
     if (ctx->emb_cache) emb_lru_set_enabled(ctx->emb_cache, ctx->embed_cache_enabled);
 }
 
+void flux_set_embed_cache_dir(flux_ctx *ctx, const char *path) {
+    if (!ctx) return;
+    if (!path || !path[0]) {
+        ctx->embed_cache_dir[0] = '\0';
+        return;
+    }
+    strncpy(ctx->embed_cache_dir, path, sizeof(ctx->embed_cache_dir) - 1);
+    ctx->embed_cache_dir[sizeof(ctx->embed_cache_dir) - 1] = '\0';
+}
+
+void flux_set_runtime_diagnostics(flux_ctx *ctx, int enable) {
+    if (!ctx) return;
+    ctx->runtime_diagnostics = enable ? 1 : 0;
+    flux_qwen3_set_runtime_diag(ctx->runtime_diagnostics);
+    flux_transformer_set_runtime_diag(ctx->runtime_diagnostics);
+}
+
 int flux_last_embed_cache_hit(flux_ctx *ctx, int *out_known) {
     if (!ctx) {
         if (out_known) *out_known = 0;
@@ -335,6 +441,27 @@ int flux_last_embed_cache_hit(flux_ctx *ctx, int *out_known) {
     }
     if (out_known) *out_known = ctx->last_embed_cache_known;
     return ctx->last_embed_cache_hit;
+}
+
+void flux_last_embed_cache_diag(flux_ctx *ctx,
+                                int *out_known,
+                                int *out_hit,
+                                uint64_t *out_prompt_hash,
+                                uint64_t *out_tokenizer_hash,
+                                uint64_t *out_revision_hash) {
+    if (!ctx) {
+        if (out_known) *out_known = 0;
+        if (out_hit) *out_hit = 0;
+        if (out_prompt_hash) *out_prompt_hash = 0;
+        if (out_tokenizer_hash) *out_tokenizer_hash = 0;
+        if (out_revision_hash) *out_revision_hash = 0;
+        return;
+    }
+    if (out_known) *out_known = ctx->last_embed_cache_known;
+    if (out_hit) *out_hit = ctx->last_embed_cache_hit;
+    if (out_prompt_hash) *out_prompt_hash = ctx->last_embed_prompt_hash;
+    if (out_tokenizer_hash) *out_tokenizer_hash = ctx->last_embed_tokenizer_hash;
+    if (out_revision_hash) *out_revision_hash = ctx->last_embed_revision_hash;
 }
 
 int flux_preload_transformer(flux_ctx *ctx) {
@@ -347,7 +474,7 @@ int flux_preload_transformer(flux_ctx *ctx) {
     }
     if (ctx->use_mmap) {
         if (flux_phase_callback) flux_phase_callback("prefaulting transformer mmap", 0);
-        int ok = prefault_transformer_mmap_pages(ctx->model_dir);
+        int ok = flux_transformer_prefault_mmap(ctx->transformer);
         if (flux_phase_callback) flux_phase_callback("prefaulting transformer mmap", 1);
         if (!ok) {
             set_error("Failed to prefault transformer mmap pages");
@@ -416,6 +543,11 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
 
     ctx->last_embed_cache_known = 0;
     ctx->last_embed_cache_hit = 0;
+    ctx->last_embed_prompt_hash = fnv1a_bytes((const unsigned char *)prompt, strlen(prompt));
+    ctx->last_embed_tokenizer_hash = fnv1a_bytes((const unsigned char *)ctx->tokenizer_config_id,
+                                                 strlen(ctx->tokenizer_config_id));
+    ctx->last_embed_revision_hash = fnv1a_bytes((const unsigned char *)ctx->model_revision_id,
+                                                strlen(ctx->model_revision_id));
 
     if (ctx->embed_cache_enabled && ctx->emb_cache) {
         float *cached = NULL;
@@ -430,6 +562,25 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
                 return cached;
             }
             free(cached);
+        }
+    }
+
+    if (ctx->embed_cache_enabled) {
+        float *disk_emb = NULL;
+        int disk_seq = 0;
+        if (embdisk_load(ctx, prompt, &disk_emb, &disk_seq)) {
+            if (disk_emb && disk_seq > 0) {
+                ctx->last_embed_cache_known = 1;
+                ctx->last_embed_cache_hit = 1;
+                if (ctx->emb_cache) {
+                    emb_lru_store(ctx->emb_cache, prompt,
+                                  ctx->tokenizer_config_id, ctx->model_revision_id,
+                                  disk_emb, disk_seq, QWEN3_TEXT_DIM);
+                }
+                *out_seq_len = disk_seq;
+                return disk_emb;
+            }
+            free(disk_emb);
         }
     }
 
@@ -483,6 +634,9 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
         emb_lru_store(ctx->emb_cache, prompt,
                         ctx->tokenizer_config_id, ctx->model_revision_id,
                         embeddings, QWEN3_MAX_SEQ_LEN, QWEN3_TEXT_DIM);
+    }
+    if (ctx->embed_cache_enabled) {
+        embdisk_store(ctx, prompt, embeddings, QWEN3_MAX_SEQ_LEN, QWEN3_TEXT_DIM);
     }
     return embeddings;
 }
@@ -1153,6 +1307,12 @@ flux_status_t flux_ctx_set_strict(flux_ctx *ctx, int enable) {
 flux_status_t flux_ctx_set_embed_cache(flux_ctx *ctx, int enable) {
     if (!ctx) return FLUX_STATUS_INVALID_ARGUMENT;
     flux_set_embed_cache(ctx, enable);
+    return FLUX_STATUS_OK;
+}
+
+flux_status_t flux_ctx_set_embed_cache_dir(flux_ctx *ctx, const char *path) {
+    if (!ctx) return FLUX_STATUS_INVALID_ARGUMENT;
+    flux_set_embed_cache_dir(ctx, path);
     return FLUX_STATUS_OK;
 }
 

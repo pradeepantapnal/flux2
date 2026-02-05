@@ -29,6 +29,22 @@ extern double flux_timing_transformer_double;
 extern double flux_timing_transformer_single;
 extern double flux_timing_transformer_final;
 
+static int g_transformer_runtime_diag = 0;
+static const char *g_transformer_last_dtype_path = "unknown";
+static const char *g_transformer_last_gemm_routing = "unknown";
+
+typedef struct flux_transformer flux_transformer_t;
+
+void flux_transformer_set_runtime_diag(int enable) {
+    g_transformer_runtime_diag = enable ? 1 : 0;
+}
+
+void flux_get_last_transformer_diag(const char **out_dtype_path,
+                                    const char **out_gemm_routing) {
+    if (out_dtype_path) *out_dtype_path = g_transformer_last_dtype_path;
+    if (out_gemm_routing) *out_gemm_routing = g_transformer_last_gemm_routing;
+}
+
 /* Helper to get current time in ms (wall-clock) */
 static double tf_get_time_ms(void) {
     struct timeval tv;
@@ -267,6 +283,22 @@ typedef struct flux_transformer {
     int use_mmap;
     safetensors_file_t *sf;
 } flux_transformer_t;
+
+int flux_transformer_prefault_mmap(flux_transformer_t *tf) {
+    if (!tf || !tf->use_mmap || !tf->sf || !tf->sf->data || tf->sf->file_size == 0) {
+        return 0;
+    }
+
+    const size_t page_size = 4096;
+    const volatile unsigned char *bytes = (const volatile unsigned char *)tf->sf->data;
+    volatile unsigned char sink = 0;
+    for (size_t off = 0; off < tf->sf->file_size; off += page_size) {
+        sink ^= bytes[off];
+    }
+    sink ^= bytes[tf->sf->file_size - 1];
+    (void)sink;
+    return 1;
+}
 
 /* Forward declarations */
 void flux_transformer_free(flux_transformer_t *tf);
@@ -2825,6 +2857,8 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     /* With direct mmap pointers, the bf16 pipeline now works correctly in mmap mode.
      * Cache entries are stable (pointers point into mmap region) so no collision. */
     if (flux_metal_available() && flux_bf16_pipeline_available() && tf->use_bf16) {
+        g_transformer_last_dtype_path = "bf16";
+        g_transformer_last_gemm_routing = "metal bf16 kernels";
         static int bf16_path_logged = 0;
         if (!bf16_path_logged) {
             bf16_path_logged = 1;
@@ -2835,6 +2869,11 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                                                            img_rope_cos, img_rope_sin,
                                                            txt_rope_cos, txt_rope_sin);
         if (bf16_output) {
+            if (g_transformer_runtime_diag) {
+                fprintf(stderr, "diag: transformer dtype=%s gemm=%s\n",
+                        g_transformer_last_dtype_path,
+                        g_transformer_last_gemm_routing);
+            }
             return bf16_output;
         } else {
             BF16_DEBUG("[BF16] bf16 pipeline failed, falling back\n");
@@ -2844,6 +2883,13 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                    flux_metal_available(), flux_bf16_pipeline_available(),
                    tf->use_mmap, tf->use_bf16);
     }
+#endif
+
+    g_transformer_last_dtype_path = "fp32";
+#ifdef USE_BLAS
+    g_transformer_last_gemm_routing = "BLAS (cblas_sgemm)";
+#else
+    g_transformer_last_gemm_routing = "fallback kernels";
 #endif
 
     /* Project image latent to hidden */
@@ -3225,6 +3271,12 @@ float *flux_transformer_forward(flux_transformer_t *tf,
 #endif
 
     if (tf->scratch_return_mode) return output;
+
+    if (g_transformer_runtime_diag) {
+        fprintf(stderr, "diag: transformer dtype=%s gemm=%s\n",
+                g_transformer_last_dtype_path,
+                g_transformer_last_gemm_routing);
+    }
 
     float *heap_out = (float *)malloc((size_t)img_seq * tf->latent_channels * sizeof(float));
     if (!heap_out) return NULL;

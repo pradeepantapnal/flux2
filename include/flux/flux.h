@@ -145,6 +145,9 @@ void flux_set_strict(flux_ctx *ctx, int enable);
 /* Enable/disable prompt embedding cache (enabled by default). */
 void flux_set_embed_cache(flux_ctx *ctx, int enable);
 
+/* Enable on-disk embedding cache in this directory (NULL/empty disables). */
+void flux_set_embed_cache_dir(flux_ctx *ctx, const char *path);
+
 /* Eagerly load transformer before first denoising step.
  * In mmap mode, also walks mapped pages sequentially once to prefault weights.
  * Returns 1 on success, 0 on failure. */
@@ -155,6 +158,27 @@ int flux_preload_transformer(flux_ctx *ctx);
  * If out_known is 0, cache was disabled or prompt encoding was not used.
  */
 int flux_last_embed_cache_hit(flux_ctx *ctx, int *out_known);
+
+/* Enable/disable verbose runtime diagnostics emitted by core components. */
+void flux_set_runtime_diagnostics(flux_ctx *ctx, int enable);
+
+/* Get last embedding-cache decision plus hashed key components. */
+void flux_last_embed_cache_diag(flux_ctx *ctx,
+                                int *out_known,
+                                int *out_hit,
+                                uint64_t *out_prompt_hash,
+                                uint64_t *out_tokenizer_hash,
+                                uint64_t *out_revision_hash);
+
+/* Get last Qwen3 encoder diagnostics. */
+void flux_get_last_qwen3_diag(int *out_tokens,
+                              int *out_padded_len,
+                              const char **out_dtype_path,
+                              const char **out_gemm_routing);
+
+/* Get last transformer diagnostics. */
+void flux_get_last_transformer_diag(const char **out_dtype_path,
+                                    const char **out_gemm_routing);
 
 /*
  * Text-to-image generation.
@@ -313,6 +337,7 @@ flux_status_t flux_ctx_release_text_encoder(flux_ctx *ctx);
 flux_status_t flux_ctx_set_mmap(flux_ctx *ctx, int enable);
 flux_status_t flux_ctx_set_strict(flux_ctx *ctx, int enable);
 flux_status_t flux_ctx_set_embed_cache(flux_ctx *ctx, int enable);
+flux_status_t flux_ctx_set_embed_cache_dir(flux_ctx *ctx, const char *path);
 flux_status_t flux_ctx_preload_transformer(flux_ctx *ctx);
 
 flux_status_t flux_generate_status(flux_ctx *ctx, const char *prompt,

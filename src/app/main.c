@@ -208,6 +208,20 @@ static const char *detect_blas_vendor(void) {
 #endif
 }
 
+static const char *detect_blas_headers(void) {
+#ifdef USE_BLAS
+#ifdef USE_OPENBLAS
+    return "cblas/openblas";
+#elif defined(__APPLE__)
+    return "Accelerate/Accelerate.h";
+#else
+    return "cblas";
+#endif
+#else
+    return "none";
+#endif
+}
+
 static const char *detect_blas_threads(char *buf, size_t buf_sz) {
     const char *openblas_env = getenv("OPENBLAS_NUM_THREADS");
     const char *omp_env = getenv("OMP_NUM_THREADS");
@@ -247,6 +261,8 @@ static void print_startup_diagnostics(int use_mmap,
     const char *blas_threads = detect_blas_threads(thread_buf, sizeof(thread_buf));
     const char *omp_val = (omp_env && omp_env[0]) ? omp_env : "unset";
     const char *openblas_val = (openblas_env && openblas_env[0]) ? openblas_env : "unset";
+    const char *veclib_env = getenv("VECLIB_MAXIMUM_THREADS");
+    const char *veclib_val = (veclib_env && veclib_env[0]) ? veclib_env : "unset";
 
 #ifdef USE_BLAS
     const char *blas_enabled = "yes";
@@ -271,6 +287,22 @@ static void print_startup_diagnostics(int use_mmap,
             detect_dtype_policy(use_mmap),
             detect_mmap_mode(use_mmap, deterministic_mode),
             embed_cache_enabled ? "on" : "off");
+
+    fprintf(stderr,
+            "diag: blas.compiled=%s; blas.headers=%s; blas.vendor.assumed=%s\n",
+            blas_enabled,
+            detect_blas_headers(),
+            blas_vendor);
+
+    if (openblas_env && openblas_env[0]) {
+        fprintf(stderr, "diag: env.OPENBLAS_NUM_THREADS=%s\n", openblas_val);
+    }
+    if (omp_env && omp_env[0]) {
+        fprintf(stderr, "diag: env.OMP_NUM_THREADS=%s\n", omp_val);
+    }
+    if (veclib_env && veclib_env[0]) {
+        fprintf(stderr, "diag: env.VECLIB_MAXIMUM_THREADS=%s\n", veclib_val);
+    }
 }
 
 /* ========================================================================
@@ -316,6 +348,7 @@ static int write_smoke_output(const char *output_path, int width, int height, in
 
 static void emit_timing_json(FILE *out,
                              double load_s,
+                             double preload_s,
                              double generate_s,
                              double save_s,
                              double end_to_end_s,
@@ -324,9 +357,9 @@ static void emit_timing_json(FILE *out,
                              int steps,
                              long long seed) {
     fprintf(out,
-            "{\"event\":\"timing\",\"schema\":\"flux_timing_v1\",\"stages\":[{\"label\":\"load_model\",\"seconds\":%.6f},{\"label\":\"generate\",\"seconds\":%.6f},{\"label\":\"save_output\",\"seconds\":%.6f},{\"label\":\"end_to_end\",\"seconds\":%.6f}],\"load_s\":%.6f,\"generate_s\":%.6f,\"save_s\":%.6f,\"end_to_end_s\":%.6f,\"width\":%d,\"height\":%d,\"steps\":%d,\"seed\":%lld}\n",
-            load_s, generate_s, save_s, end_to_end_s,
-            load_s, generate_s, save_s, end_to_end_s,
+            "{\"event\":\"timing\",\"schema\":\"flux_timing_v1\",\"stages\":[{\"label\":\"load_model\",\"seconds\":%.6f},{\"label\":\"preload_mmap\",\"seconds\":%.6f},{\"label\":\"generate\",\"seconds\":%.6f},{\"label\":\"save_output\",\"seconds\":%.6f},{\"label\":\"end_to_end\",\"seconds\":%.6f}],\"load_s\":%.6f,\"preload_s\":%.6f,\"generate_s\":%.6f,\"save_s\":%.6f,\"end_to_end_s\":%.6f,\"width\":%d,\"height\":%d,\"steps\":%d,\"seed\":%lld}\n",
+            load_s, preload_s, generate_s, save_s, end_to_end_s,
+            load_s, preload_s, generate_s, save_s, end_to_end_s,
             width, height, steps, seed);
 }
 
@@ -357,6 +390,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "      --deterministic   Force deterministic behavior and print banner\n");
     fprintf(stderr, "      --strict          Fail if prompt embeddings are unavailable\n");
     fprintf(stderr, "      --no-embed-cache Disable prompt embedding cache\n");
+    fprintf(stderr, "      --embcache-dir PATH\n                        Enable on-disk embedding cache directory\n");
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
     fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default, fastest on MPS)\n");
     fprintf(stderr, "      --no-mmap         Disable mmap, load all weights upfront\n");
@@ -409,6 +443,7 @@ int main(int argc, char *argv[]) {
         {"deterministic", no_argument,    0, 'D'},
         {"strict",     no_argument,       0, 'r'},
         {"no-embed-cache", no_argument,   0, 1000},
+        {"embcache-dir", required_argument, 0, 1001},
         {0, 0, 0, 0}
     };
 
@@ -438,6 +473,7 @@ int main(int argc, char *argv[]) {
     int strict_mode = 0;
     int deterministic_mode = 0;
     int embed_cache_enabled = 1;
+    char *embcache_dir = NULL;
     int preload_transformer = 0;
     term_graphics_proto graphics_proto = detect_terminal_graphics();
 
@@ -478,6 +514,7 @@ int main(int argc, char *argv[]) {
             case 'D': deterministic_mode = 1; break;
             case 'r': strict_mode = 1; break;
             case 1000: embed_cache_enabled = 0; break;
+            case 1001: embcache_dir = optarg; break;
             default:
                 print_usage(argv[0]);
                 return 1;
@@ -526,7 +563,7 @@ int main(int argc, char *argv[]) {
 
         if (timing_output) {
             emit_timing_json(stdout,
-                             0.0, 0.0, 0.0, 0.0,
+                             0.0, 0.0, 0.0, 0.0, 0.0,
                              params.width, params.height, params.num_steps,
                              (long long)smoke_seed);
 
@@ -536,7 +573,7 @@ int main(int argc, char *argv[]) {
                     fprintf(stderr, "Warning: Failed to open timing output file: %s\n", timing_json_out);
                 } else {
                     emit_timing_json(timing_file,
-                                     0.0, 0.0, 0.0, 0.0,
+                                     0.0, 0.0, 0.0, 0.0, 0.0,
                                      params.width, params.height, params.num_steps,
                                      (long long)smoke_seed);
                     fclose(timing_file);
@@ -633,7 +670,12 @@ int main(int argc, char *argv[]) {
     }
     flux_set_strict(ctx, strict_mode);
     flux_set_embed_cache(ctx, embed_cache_enabled);
+    if (embcache_dir && embcache_dir[0]) {
+        flux_ctx_set_embed_cache_dir(ctx, embcache_dir);
+    }
+    flux_set_runtime_diagnostics(ctx, print_startup_line ? 1 : 0);
 
+    double preload_time = 0.0;
     if (preload_transformer) {
         LOG_NORMAL("Preloading transformer...");
         if (output_level >= OUTPUT_NORMAL) fflush(stderr);
@@ -643,7 +685,8 @@ int main(int argc, char *argv[]) {
             flux_ctx_free(ctx);
             return 1;
         }
-        LOG_NORMAL(" done (%.1fs)\n", timer_end());
+        preload_time = timer_end();
+        LOG_NORMAL(" done (%.1fs)\n", preload_time);
     }
 
     double load_time = timer_end();
@@ -817,13 +860,35 @@ int main(int argc, char *argv[]) {
     }
 
     if (print_startup_line && prompt && !embeddings_path) {
-        int cache_known = 0;
-        int cache_hit = flux_last_embed_cache_hit(ctx, &cache_known);
+        int cache_known = 0, cache_hit = 0;
+        uint64_t prompt_hash = 0, tok_hash = 0, rev_hash = 0;
+        flux_last_embed_cache_diag(ctx, &cache_known, &cache_hit,
+                                   &prompt_hash, &tok_hash, &rev_hash);
         if (cache_known) {
             LOG_NORMAL("embedding cache: %s\n", cache_hit ? "hit" : "miss");
+            LOG_NORMAL("embcache %s key[prompt=%016llx tok=%016llx rev=%016llx]\n",
+                       cache_hit ? "HIT" : "MISS",
+                       (unsigned long long)prompt_hash,
+                       (unsigned long long)tok_hash,
+                       (unsigned long long)rev_hash);
         } else {
             LOG_NORMAL("embedding cache: n/a\n");
         }
+    }
+
+    if (print_startup_line) {
+        int q_tokens = 0, q_padded = 0;
+        const char *q_dtype = "unknown";
+        const char *q_gemm = "unknown";
+        const char *tf_dtype = "unknown";
+        const char *tf_gemm = "unknown";
+        flux_get_last_qwen3_diag(&q_tokens, &q_padded, &q_dtype, &q_gemm);
+        flux_get_last_transformer_diag(&tf_dtype, &tf_gemm);
+        if (prompt && !embeddings_path) {
+            LOG_NORMAL("diag: qwen3 seq(tokens=%d padded=%d) dtype=%s gemm=%s\n",
+                       q_tokens, q_padded, q_dtype, q_gemm);
+        }
+        LOG_NORMAL("diag: transformer dtype=%s gemm=%s\n", tf_dtype, tf_gemm);
     }
 
     struct timeval total_end_tv;
@@ -867,7 +932,7 @@ int main(int argc, char *argv[]) {
 
     if (timing_output) {
         emit_timing_json(stdout,
-                         load_time, total_time, save_time, load_time + total_time_final,
+                         load_time, preload_time, total_time, save_time, load_time + total_time_final,
                          output->width, output->height, params.num_steps,
                          (long long)actual_seed);
 
@@ -877,7 +942,7 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "Warning: Failed to open timing output file: %s\n", timing_json_out);
             } else {
                 emit_timing_json(timing_file,
-                                 load_time, total_time, save_time, load_time + total_time_final,
+                                 load_time, preload_time, total_time, save_time, load_time + total_time_final,
                                  output->width, output->height, params.num_steps,
                                  (long long)actual_seed);
                 fclose(timing_file);
