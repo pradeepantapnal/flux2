@@ -193,6 +193,87 @@ static double timer_end(void) {
 #define LOG_VERBOSE(...) do { if (output_level >= OUTPUT_VERBOSE) fprintf(stderr, __VA_ARGS__); } while(0)
 
 /* ========================================================================
+ * Startup Diagnostics
+ * ======================================================================== */
+
+static const char *detect_blas_vendor(void) {
+#ifdef USE_BLAS
+#ifdef USE_OPENBLAS
+    return "openblas";
+#else
+    return "accelerate";
+#endif
+#else
+    return "none";
+#endif
+}
+
+static const char *detect_blas_threads(char *buf, size_t buf_sz) {
+    const char *openblas_env = getenv("OPENBLAS_NUM_THREADS");
+    const char *omp_env = getenv("OMP_NUM_THREADS");
+    if (openblas_env && openblas_env[0]) {
+        snprintf(buf, buf_sz, "%s (OPENBLAS_NUM_THREADS)", openblas_env);
+        return buf;
+    }
+    if (omp_env && omp_env[0]) {
+        snprintf(buf, buf_sz, "%s (OMP_NUM_THREADS)", omp_env);
+        return buf;
+    }
+    return "unknown";
+}
+
+static const char *detect_dtype_policy(int use_mmap) {
+#ifdef USE_METAL
+    return use_mmap ? "qwen3=bf16(on-demand), transformer=bf16" : "qwen3=bf16(resident), transformer=bf16";
+#elif defined(USE_BLAS)
+    return use_mmap ? "qwen3=bf16->fp32(on-demand), transformer=fp32" : "qwen3=fp32(resident), transformer=fp32";
+#else
+    return use_mmap ? "qwen3=bf16->fp32(on-demand), transformer=fp32" : "qwen3=fp32(resident), transformer=fp32";
+#endif
+}
+
+static const char *detect_mmap_mode(int use_mmap, int deterministic_mode) {
+    if (!use_mmap) return "off";
+    return deterministic_mode ? "resident" : "on-demand";
+}
+
+static void print_startup_diagnostics(int use_mmap,
+                                      int deterministic_mode,
+                                      int embed_cache_enabled) {
+    char thread_buf[64];
+    const char *openblas_env = getenv("OPENBLAS_NUM_THREADS");
+    const char *omp_env = getenv("OMP_NUM_THREADS");
+    const char *blas_vendor = detect_blas_vendor();
+    const char *blas_threads = detect_blas_threads(thread_buf, sizeof(thread_buf));
+    const char *omp_val = (omp_env && omp_env[0]) ? omp_env : "unset";
+    const char *openblas_val = (openblas_env && openblas_env[0]) ? openblas_env : "unset";
+
+#ifdef USE_BLAS
+    const char *blas_enabled = "yes";
+#else
+    const char *blas_enabled = "no";
+#endif
+
+    fprintf(stderr,
+            "startup: backend=%s (BLAS %s); vendor=%s; threads=%s; env[OMP_NUM_THREADS=%s OPENBLAS_NUM_THREADS=%s]; dtype[%s]; mmap=%s; embed_cache=%s\n",
+#ifdef USE_METAL
+            "metal",
+#elif defined(USE_BLAS)
+            "blas",
+#else
+            "generic",
+#endif
+            blas_enabled,
+            blas_vendor,
+            blas_threads,
+            omp_val,
+            openblas_val,
+            detect_dtype_policy(use_mmap),
+            detect_mmap_mode(use_mmap, deterministic_mode),
+            embed_cache_enabled ? "on" : "off");
+}
+
+/* ========================================================================
  * Usage and Help
  * ======================================================================== */
 
@@ -279,6 +360,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
     fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default, fastest on MPS)\n");
     fprintf(stderr, "      --no-mmap         Disable mmap, load all weights upfront\n");
+    fprintf(stderr, "      --preload         Preload transformer before denoising (prefault mmap pages)\n");
     fprintf(stderr, "  -h, --help            Show this help\n\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  %s -d model/ -p \"a cat on a rainbow\" -o cat.png\n", prog);
@@ -317,6 +399,7 @@ int main(int argc, char *argv[]) {
         {"version",    no_argument,       0, 'V'},
         {"mmap",       no_argument,       0, 'm'},
         {"no-mmap",    no_argument,       0, 'M'},
+        {"preload",   no_argument,       0, 'P'},
         {"show",       no_argument,       0, 'k'},
         {"show-steps", no_argument,       0, 'K'},
         {"smoke",      no_argument,       0, 'x'},
@@ -355,10 +438,11 @@ int main(int argc, char *argv[]) {
     int strict_mode = 0;
     int deterministic_mode = 0;
     int embed_cache_enabled = 1;
+    int preload_transformer = 0;
     term_graphics_proto graphics_proto = detect_terminal_graphics();
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:S:i:e:n:qvhVmMkKtxrDj:",
+    while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:S:i:e:n:qvhVmMkKtxrDj:P",
                               long_options, NULL)) != -1) {
         switch (opt) {
             case 'd': model_dir = optarg; break;
@@ -385,6 +469,7 @@ int main(int argc, char *argv[]) {
                 return 0;
             case 'm': use_mmap = 1; break;
             case 'M': use_mmap = 0; break;
+            case 'P': preload_transformer = 1; break;
             case 'k': show_image = 1; break;
             case 'K': show_steps = 1; break;
             case 'x': smoke_mode = 1; break;
@@ -402,6 +487,11 @@ int main(int argc, char *argv[]) {
     if (deterministic_mode) {
         fprintf(stderr, "[deterministic] mode enabled: fixed seed + stable smoke output\n");
         use_mmap = 0;
+    }
+
+    int print_startup_line = (output_level >= OUTPUT_VERBOSE) || timing_output;
+    if (print_startup_line) {
+        print_startup_diagnostics(use_mmap, deterministic_mode, embed_cache_enabled);
     }
 
     if (smoke_mode) {
@@ -543,6 +633,18 @@ int main(int argc, char *argv[]) {
     }
     flux_set_strict(ctx, strict_mode);
     flux_set_embed_cache(ctx, embed_cache_enabled);
+
+    if (preload_transformer) {
+        LOG_NORMAL("Preloading transformer...");
+        if (output_level >= OUTPUT_NORMAL) fflush(stderr);
+        timer_begin();
+        if (flux_ctx_preload_transformer(ctx) != FLUX_STATUS_OK) {
+            fprintf(stderr, "\nError: Failed to preload transformer: %s\n", flux_get_error());
+            flux_ctx_free(ctx);
+            return 1;
+        }
+        LOG_NORMAL(" done (%.1fs)\n", timer_end());
+    }
 
     double load_time = timer_end();
     LOG_NORMAL(" done (%.1fs)\n", load_time);
@@ -712,6 +814,16 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: Generation failed: %s\n", flux_get_error());
         flux_ctx_free(ctx);
         return 1;
+    }
+
+    if (print_startup_line && prompt && !embeddings_path) {
+        int cache_known = 0;
+        int cache_hit = flux_last_embed_cache_hit(ctx, &cache_known);
+        if (cache_known) {
+            LOG_NORMAL("embedding cache: %s\n", cache_hit ? "hit" : "miss");
+        } else {
+            LOG_NORMAL("embedding cache: n/a\n");
+        }
     }
 
     struct timeval total_end_tv;
