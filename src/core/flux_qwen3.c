@@ -37,6 +37,26 @@
  * Fixes issue #9: SIGKILL on 16GB Metal systems during text encoding. */
 #define QWEN3_MIN_GPU_ELEMENTS (10 * 1024 * 1024)
 
+static int g_qwen3_runtime_diag = 0;
+static int g_qwen3_last_tokens = 0;
+static int g_qwen3_last_padded_len = 0;
+static const char *g_qwen3_last_dtype_path = "unknown";
+static const char *g_qwen3_last_gemm_routing = "unknown";
+
+void flux_qwen3_set_runtime_diag(int enable) {
+    g_qwen3_runtime_diag = enable ? 1 : 0;
+}
+
+void flux_get_last_qwen3_diag(int *out_tokens,
+                              int *out_padded_len,
+                              const char **out_dtype_path,
+                              const char **out_gemm_routing) {
+    if (out_tokens) *out_tokens = g_qwen3_last_tokens;
+    if (out_padded_len) *out_padded_len = g_qwen3_last_padded_len;
+    if (out_dtype_path) *out_dtype_path = g_qwen3_last_dtype_path;
+    if (out_gemm_routing) *out_gemm_routing = g_qwen3_last_gemm_routing;
+}
+
 /* ========================================================================
  * Data Structures
  * ======================================================================== */
@@ -813,9 +833,23 @@ float *qwen3_forward(qwen3_model_t *model, const int *input_ids,
 #ifdef USE_METAL
     /* Start batch mode to reduce GPU sync overhead between layers */
     int batch_mode = model->use_bf16 && flux_metal_available();
+    g_qwen3_last_dtype_path = batch_mode ? "bf16" : "fp32";
+    g_qwen3_last_gemm_routing = batch_mode ? "metal bf16 kernels" :
+#ifdef USE_BLAS
+                                "BLAS (cblas_sgemm)";
+#else
+                                "fallback kernels";
+#endif
     if (batch_mode) {
         flux_gpu_batch_begin();
     }
+#else
+    g_qwen3_last_dtype_path = "fp32";
+#ifdef USE_BLAS
+    g_qwen3_last_gemm_routing = "BLAS (cblas_sgemm)";
+#else
+    g_qwen3_last_gemm_routing = "fallback kernels";
+#endif
 #endif
 
     for (int layer_idx = 0; layer_idx < model->num_layers; layer_idx++) {
@@ -1372,6 +1406,8 @@ float *qwen3_encode_text(qwen3_encoder_t *enc, const char *prompt) {
     int num_tokens;
     int *tokens = qwen3_tokenize_chat(enc->tokenizer, prompt, &num_tokens, QWEN3_MAX_SEQ_LEN);
     if (!tokens) return NULL;
+    g_qwen3_last_tokens = num_tokens;
+    g_qwen3_last_padded_len = QWEN3_MAX_SEQ_LEN;
 
     /* Pad to max length */
     int *attention_mask = malloc(QWEN3_MAX_SEQ_LEN * sizeof(int));
@@ -1385,6 +1421,15 @@ float *qwen3_encode_text(qwen3_encoder_t *enc, const char *prompt) {
 
     /* Forward pass */
     float *embeddings = qwen3_forward(enc->model, padded_tokens, attention_mask, QWEN3_MAX_SEQ_LEN);
+
+    if (g_qwen3_runtime_diag) {
+        fprintf(stderr,
+                "diag: qwen3 seq(tokens=%d padded=%d) dtype=%s gemm=%s\n",
+                g_qwen3_last_tokens,
+                g_qwen3_last_padded_len,
+                g_qwen3_last_dtype_path,
+                g_qwen3_last_gemm_routing);
+    }
 
     free(padded_tokens);
     free(attention_mask);
