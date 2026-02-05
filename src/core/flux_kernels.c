@@ -11,6 +11,10 @@
 #include <string.h>
 #include <stdlib.h>
 
+#ifdef USE_CUDA
+#include "flux_cuda.h"
+#endif
+
 /* Use Metal for GPU acceleration on Apple Silicon */
 #ifdef USE_METAL
 #include "flux_metal.h"
@@ -45,6 +49,112 @@ static uint64_t rng_state[4] = {
     0x647c4677a2884327ULL,
     0xc6e7918d2e2969f5ULL
 };
+
+static flux_backend_t g_compute_backend = FLUX_BACKEND_CPU;
+static flux_dtype_t g_compute_dtype = FLUX_DTYPE_FP32;
+static uint64_t g_cuda_gemm_counter = 0;
+
+void flux_set_compute_policy(flux_backend_t backend, flux_dtype_t dtype) {
+    g_compute_backend = backend;
+    g_compute_dtype = dtype;
+}
+
+flux_backend_t flux_get_compute_backend(void) {
+    return g_compute_backend;
+}
+
+flux_dtype_t flux_get_compute_dtype(void) {
+    return g_compute_dtype;
+}
+
+void flux_reset_cuda_gemm_counter(void) {
+    g_cuda_gemm_counter = 0;
+}
+
+uint64_t flux_get_cuda_gemm_counter(void) {
+    return g_cuda_gemm_counter;
+}
+
+int flux_buffer_alloc(flux_buffer *buf, size_t bytes, flux_dtype_t dtype, flux_device_t device) {
+    if (!buf) return -1;
+    memset(buf, 0, sizeof(*buf));
+    buf->bytes = bytes;
+    buf->dtype = dtype;
+    buf->device = device;
+    if (bytes == 0) return 0;
+
+    if (device == FLUX_DEVICE_CPU) {
+        buf->ptr = malloc(bytes);
+        return buf->ptr ? 0 : -1;
+    }
+#ifdef USE_CUDA
+    return flux_cuda_malloc(&buf->ptr, bytes);
+#else
+    return -1;
+#endif
+}
+
+void flux_buffer_free(flux_buffer *buf) {
+    if (!buf || !buf->ptr) return;
+    if (buf->device == FLUX_DEVICE_CPU) {
+        free(buf->ptr);
+    }
+#ifdef USE_CUDA
+    else {
+        flux_cuda_free(buf->ptr);
+    }
+#endif
+    memset(buf, 0, sizeof(*buf));
+}
+
+int flux_buffer_copy(flux_buffer *dst, const flux_buffer *src, size_t bytes) {
+    if (!dst || !src || !dst->ptr || !src->ptr) return -1;
+    if (bytes > dst->bytes || bytes > src->bytes) return -1;
+    if (dst->device == FLUX_DEVICE_CPU && src->device == FLUX_DEVICE_CPU) {
+        memcpy(dst->ptr, src->ptr, bytes);
+        return 0;
+    }
+#ifdef USE_CUDA
+    if (dst->device == FLUX_DEVICE_CUDA && src->device == FLUX_DEVICE_CPU) {
+        return flux_cuda_memcpy_h2d(dst->ptr, src->ptr, bytes);
+    }
+    if (dst->device == FLUX_DEVICE_CPU && src->device == FLUX_DEVICE_CUDA) {
+        return flux_cuda_memcpy_d2h(dst->ptr, src->ptr, bytes);
+    }
+#endif
+    return -1;
+}
+
+#ifdef USE_CUDA
+static inline uint16_t float_to_fp16_bits(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, sizeof(bits));
+    uint32_t sign = (bits >> 31) & 0x1;
+    int exp = (int)((bits >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = bits & 0x7FFFFF;
+    if (exp <= 0) return (uint16_t)(sign << 15);
+    if (exp >= 31) return (uint16_t)((sign << 15) | 0x7C00);
+    return (uint16_t)((sign << 15) | ((uint32_t)exp << 10) | (mant >> 13));
+}
+
+static inline float fp16_bits_to_float(uint16_t h) {
+    uint32_t sign = ((uint32_t)h >> 15) & 0x1;
+    uint32_t exp = ((uint32_t)h >> 10) & 0x1F;
+    uint32_t mant = (uint32_t)h & 0x3FF;
+    uint32_t bits;
+    if (exp == 0) {
+        bits = sign << 31;
+    } else if (exp == 31) {
+        bits = (sign << 31) | 0x7F800000;
+    } else {
+        uint32_t e = exp - 15 + 127;
+        bits = (sign << 31) | (e << 23) | (mant << 13);
+    }
+    float out;
+    memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+#endif
 
 static inline uint64_t rotl(const uint64_t x, int k) {
     return (x << k) | (x >> (64 - k));
@@ -133,6 +243,49 @@ void flux_axpy(float *a, float scale, const float *b, int n) {
 void flux_matmul(float *C, const float *A, const float *B,
                  int M, int K, int N) {
     /* C[M,N] = A[M,K] @ B[K,N] */
+
+#ifdef USE_CUDA
+    if (g_compute_backend == FLUX_BACKEND_CUDA && g_compute_dtype == FLUX_DTYPE_FP16) {
+        size_t a_elems = (size_t)M * K;
+        size_t b_elems = (size_t)K * N;
+        size_t c_elems = (size_t)M * N;
+        uint16_t *hA = (uint16_t *)malloc(a_elems * sizeof(uint16_t));
+        uint16_t *hB = (uint16_t *)malloc(b_elems * sizeof(uint16_t));
+        uint16_t *hC = (uint16_t *)malloc(c_elems * sizeof(uint16_t));
+        flux_buffer dA = {0}, dB = {0}, dC = {0};
+        if (!hA || !hB || !hC) goto cuda_cleanup;
+        if (flux_buffer_alloc(&dA, a_elems * sizeof(uint16_t), FLUX_DTYPE_FP16, FLUX_DEVICE_CUDA) != 0) goto cuda_cleanup;
+        if (flux_buffer_alloc(&dB, b_elems * sizeof(uint16_t), FLUX_DTYPE_FP16, FLUX_DEVICE_CUDA) != 0) goto cuda_cleanup;
+        if (flux_buffer_alloc(&dC, c_elems * sizeof(uint16_t), FLUX_DTYPE_FP16, FLUX_DEVICE_CUDA) != 0) goto cuda_cleanup;
+
+        for (size_t i = 0; i < a_elems; i++) hA[i] = float_to_fp16_bits(A[i]);
+        for (size_t i = 0; i < b_elems; i++) hB[i] = float_to_fp16_bits(B[i]);
+        flux_buffer hAb = {.ptr = hA, .bytes = a_elems * sizeof(uint16_t), .dtype = FLUX_DTYPE_FP16, .device = FLUX_DEVICE_CPU};
+        flux_buffer hBb = {.ptr = hB, .bytes = b_elems * sizeof(uint16_t), .dtype = FLUX_DTYPE_FP16, .device = FLUX_DEVICE_CPU};
+        flux_buffer hCb = {.ptr = hC, .bytes = c_elems * sizeof(uint16_t), .dtype = FLUX_DTYPE_FP16, .device = FLUX_DEVICE_CPU};
+
+        if (flux_buffer_copy(&dA, &hAb, hAb.bytes) == 0 &&
+            flux_buffer_copy(&dB, &hBb, hBb.bytes) == 0 &&
+            flux_cuda_gemm_fp16((const flux_fp16 *)dA.ptr, (const flux_fp16 *)dB.ptr, (flux_fp16 *)dC.ptr, M, N, K) == 0 &&
+            flux_buffer_copy(&hCb, &dC, hCb.bytes) == 0) {
+            for (size_t i = 0; i < c_elems; i++) C[i] = fp16_bits_to_float(hC[i]);
+            g_cuda_gemm_counter++;
+            flux_buffer_free(&dC);
+            flux_buffer_free(&dB);
+            flux_buffer_free(&dA);
+            free(hA); free(hB); free(hC);
+            return;
+        }
+
+cuda_cleanup:
+        flux_buffer_free(&dC);
+        flux_buffer_free(&dB);
+        flux_buffer_free(&dA);
+        if (hA) free(hA);
+        if (hB) free(hB);
+        if (hC) free(hC);
+    }
+#endif
 
 #ifdef USE_METAL
     size_t matrix_elements = (size_t)M * N;

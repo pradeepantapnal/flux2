@@ -239,14 +239,14 @@ static const char *detect_blas_threads(char *buf, size_t buf_sz) {
     return "unknown";
 }
 
-static const char *detect_dtype_policy(int use_mmap) {
-#ifdef USE_METAL
-    return use_mmap ? "qwen3=bf16(on-demand), transformer=bf16" : "qwen3=bf16(resident), transformer=bf16";
-#elif defined(USE_BLAS)
-    return use_mmap ? "qwen3=bf16->fp32(on-demand), transformer=fp32" : "qwen3=fp32(resident), transformer=fp32";
-#else
-    return use_mmap ? "qwen3=bf16->fp32(on-demand), transformer=fp32" : "qwen3=fp32(resident), transformer=fp32";
-#endif
+static const char *detect_dtype_policy(int use_mmap, const char *backend, const char *dtype) {
+    (void)use_mmap;
+    if (strcmp(backend, "cuda") == 0) {
+        if (strcmp(dtype, "fp16") == 0) return "qwen3=fp32, transformer=fp16(cuda)";
+        if (strcmp(dtype, "bf16") == 0) return "qwen3=fp32, transformer=bf16(requested, fallback fp32)";
+        return "qwen3=fp32, transformer=fp32(cuda)";
+    }
+    return "qwen3=fp32, transformer=fp32(cpu)";
 }
 
 static const char *detect_mmap_mode(int use_mmap, int deterministic_mode) {
@@ -257,7 +257,8 @@ static const char *detect_mmap_mode(int use_mmap, int deterministic_mode) {
 static void print_startup_diagnostics(int use_mmap,
                                       int deterministic_mode,
                                       int embed_cache_enabled,
-                                      const char *selected_backend) {
+                                      const char *selected_backend,
+                                      const char *dtype) {
     char thread_buf[64];
     const char *openblas_env = getenv("OPENBLAS_NUM_THREADS");
     const char *omp_env = getenv("OMP_NUM_THREADS");
@@ -282,7 +283,7 @@ static void print_startup_diagnostics(int use_mmap,
             blas_threads,
             omp_val,
             openblas_val,
-            detect_dtype_policy(use_mmap),
+            detect_dtype_policy(use_mmap, selected_backend, dtype),
             detect_mmap_mode(use_mmap, deterministic_mode),
             embed_cache_enabled ? "on" : "off");
 
@@ -383,6 +384,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "      --show-steps      Display each denoising step (slower)\n\n");
     fprintf(stderr, "Other options:\n");
     fprintf(stderr, "      --backend cpu|cuda Choose execution backend (default: cpu)\n");
+    fprintf(stderr, "      --dtype fp16|bf16|fp32 Compute dtype policy (default: fp16 on cuda, fp32 on cpu)\n");
     fprintf(stderr, "      --cuda-test       Run a tiny fp16 CUDA GEMM self-test and exit\n");
     fprintf(stderr, "      --diag            Print backend/runtime diagnostics\n");
     fprintf(stderr, "      --smoke, --no-weights\n                        Run no-weights smoke check and exit\n");
@@ -442,6 +444,7 @@ int main(int argc, char *argv[]) {
         {"deterministic", no_argument,    0, 'D'},
         {"strict",     no_argument,       0, 'r'},
         {"backend",    required_argument, 0, 1003},
+        {"dtype",      required_argument, 0, 1006},
         {"cuda-test",  no_argument,       0, 1004},
         {"diag",       no_argument,       0, 1005},
         {"no-embed-cache", no_argument,   0, 1000},
@@ -459,6 +462,7 @@ int main(int argc, char *argv[]) {
     char *noise_path = NULL;
 
     const char *backend = "cpu";
+    const char *dtype_arg = NULL;
     int cuda_test_mode = 0;
     int diag_mode = 0;
 
@@ -526,6 +530,7 @@ int main(int argc, char *argv[]) {
             case 1003: backend = optarg; break;
             case 1004: cuda_test_mode = 1; break;
             case 1005: diag_mode = 1; break;
+            case 1006: dtype_arg = optarg; break;
             default:
                 print_usage(argv[0]);
                 return 1;
@@ -547,9 +552,28 @@ int main(int argc, char *argv[]) {
         use_mmap = 0;
     }
 
+    const char *dtype = dtype_arg;
+    if (!dtype) dtype = (strcmp(backend, "cuda") == 0) ? "fp16" : "fp32";
+    if (strcmp(dtype, "fp16") != 0 && strcmp(dtype, "bf16") != 0 && strcmp(dtype, "fp32") != 0) {
+        fprintf(stderr, "Error: --dtype must be one of: fp16, bf16, fp32\n");
+        return 1;
+    }
+
+    flux_backend_t compute_backend = (strcmp(backend, "cuda") == 0) ? FLUX_BACKEND_CUDA : FLUX_BACKEND_CPU;
+    flux_dtype_t compute_dtype = FLUX_DTYPE_FP32;
+    if (strcmp(dtype, "fp16") == 0) compute_dtype = FLUX_DTYPE_FP16;
+    else if (strcmp(dtype, "bf16") == 0) compute_dtype = FLUX_DTYPE_BF16;
+
+    if (compute_backend == FLUX_BACKEND_CPU && compute_dtype != FLUX_DTYPE_FP32) {
+        fprintf(stderr, "Warning: CPU backend currently uses fp32 compute; overriding --dtype=%s to fp32\n", dtype);
+        compute_dtype = FLUX_DTYPE_FP32;
+        dtype = "fp32";
+    }
+    flux_set_compute_policy(compute_backend, compute_dtype);
+
     int print_startup_line = (output_level >= OUTPUT_VERBOSE) || timing_output || diag_mode;
     if (print_startup_line) {
-        print_startup_diagnostics(use_mmap, deterministic_mode, embed_cache_enabled, backend);
+        print_startup_diagnostics(use_mmap, deterministic_mode, embed_cache_enabled, backend, dtype);
     }
 
     if (strcmp(backend, "cpu") != 0 && strcmp(backend, "cuda") != 0) {
@@ -723,6 +747,8 @@ int main(int argc, char *argv[]) {
         flux_ctx_set_embed_cache_dir(ctx, embcache_dir);
     }
     flux_set_runtime_diagnostics(ctx, print_startup_line ? 1 : 0);
+    flux_set_timing_enabled((timing_output || diag_mode) ? 1 : 0);
+    flux_reset_cuda_gemm_counter();
 
     double preload_time = 0.0;
     if (preload_transformer) {
@@ -938,6 +964,10 @@ int main(int argc, char *argv[]) {
                        q_tokens, q_padded, q_dtype, q_gemm);
         }
         LOG_NORMAL("diag: transformer dtype=%s gemm=%s\n", tf_dtype, tf_gemm);
+        if (strcmp(backend, "cuda") == 0) {
+            LOG_NORMAL("diag: cuda.gemm.calls=%llu\n",
+                       (unsigned long long)flux_get_cuda_gemm_counter());
+        }
     }
 
     struct timeval total_end_tv;

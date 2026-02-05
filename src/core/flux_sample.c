@@ -17,6 +17,10 @@
 #ifdef USE_METAL
 #include "flux_metal.h"
 #endif
+#ifdef USE_CUDA
+#include "flux_cuda.h"
+#include <cuda_runtime.h>
+#endif
 
 /* Timing utilities for performance analysis - use wall-clock time */
 static double get_time_ms(void) {
@@ -30,6 +34,9 @@ double flux_timing_transformer_total = 0.0;
 double flux_timing_transformer_double = 0.0;
 double flux_timing_transformer_single = 0.0;
 double flux_timing_transformer_final = 0.0;
+static int g_timing_enabled = 0;
+
+void flux_set_timing_enabled(int enable) { g_timing_enabled = enable ? 1 : 0; }
 
 void flux_reset_timing(void) {
     flux_timing_transformer_total = 0.0;
@@ -217,8 +224,23 @@ float *flux_sample_euler(void *transformer, void *text_encoder,
     double total_denoising_start = get_time_ms();
     double step_times[FLUX_MAX_STEPS];
     const int scratch_timing = getenv("FLUX_SCRATCH_TIMING") != NULL;
+#ifdef USE_CUDA
+    const int use_cuda_timer = (flux_get_compute_backend() == FLUX_BACKEND_CUDA);
+    cudaEvent_t total_evt_start = NULL, total_evt_end = NULL;
+    cudaEvent_t step_evt_start = NULL, step_evt_end = NULL;
+    if (use_cuda_timer) {
+        cudaEventCreate(&total_evt_start);
+        cudaEventCreate(&total_evt_end);
+        cudaEventCreate(&step_evt_start);
+        cudaEventCreate(&step_evt_end);
+        cudaEventRecord(total_evt_start, 0);
+    }
+#endif
     for (int step = 0; step < num_steps; step++) {
         double scratch_step_t0 = scratch_timing ? get_time_ms() : 0.0;
+#ifdef USE_CUDA
+        if (use_cuda_timer) cudaEventRecord(step_evt_start, 0);
+#endif
         float t_curr = schedule[step];
         float t_next = schedule[step + 1];
         float dt = t_next - t_curr;  /* Negative for denoising */
@@ -238,6 +260,15 @@ float *flux_sample_euler(void *transformer, void *text_encoder,
 
 
         step_times[step] = get_time_ms() - step_start;
+#ifdef USE_CUDA
+        if (use_cuda_timer) {
+            float ms = 0.0f;
+            cudaEventRecord(step_evt_end, 0);
+            cudaEventSynchronize(step_evt_end);
+            cudaEventElapsedTime(&ms, step_evt_start, step_evt_end);
+            step_times[step] = (double)ms;
+        }
+#endif
 
         if (progress_callback) {
             progress_callback(step + 1, num_steps);
@@ -260,19 +291,36 @@ float *flux_sample_euler(void *transformer, void *text_encoder,
 
     /* Print timing summary */
     double total_denoising = get_time_ms() - total_denoising_start;
-    fprintf(stderr, "\nDenoising timing breakdown:\n");
-    for (int step = 0; step < num_steps; step++) {
-        fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+#ifdef USE_CUDA
+    if (use_cuda_timer) {
+        float total_ms = 0.0f;
+        cudaEventRecord(total_evt_end, 0);
+        cudaEventSynchronize(total_evt_end);
+        cudaEventElapsedTime(&total_ms, total_evt_start, total_evt_end);
+        total_denoising = (double)total_ms;
+        cudaEventDestroy(step_evt_end);
+        cudaEventDestroy(step_evt_start);
+        cudaEventDestroy(total_evt_end);
+        cudaEventDestroy(total_evt_start);
     }
-    fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
-    fprintf(stderr, "  Transformer breakdown:\n");
-    fprintf(stderr, "    Double blocks: %.1f ms (%.1f%%)\n",
-            flux_timing_transformer_double, 100.0 * flux_timing_transformer_double / flux_timing_transformer_total);
-    fprintf(stderr, "    Single blocks: %.1f ms (%.1f%%)\n",
-            flux_timing_transformer_single, 100.0 * flux_timing_transformer_single / flux_timing_transformer_total);
-    fprintf(stderr, "    Final layer:   %.1f ms (%.1f%%)\n",
-            flux_timing_transformer_final, 100.0 * flux_timing_transformer_final / flux_timing_transformer_total);
-    fprintf(stderr, "    Total:         %.1f ms\n", flux_timing_transformer_total);
+#endif
+    if (g_timing_enabled) {
+        double total_tf = (flux_timing_transformer_total > 0.0) ? flux_timing_transformer_total : 1.0;
+        fprintf(stderr, "\nDenoising timing breakdown:\n");
+        for (int step = 0; step < num_steps; step++) {
+            fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+        }
+        fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
+        fprintf(stderr, "  Transformer breakdown:\n");
+        fprintf(stderr, "    Double blocks: %.1f ms (%.1f%%)\n",
+                flux_timing_transformer_double, 100.0 * flux_timing_transformer_double / total_tf);
+        fprintf(stderr, "    Single blocks: %.1f ms (%.1f%%)\n",
+                flux_timing_transformer_single, 100.0 * flux_timing_transformer_single / total_tf);
+        fprintf(stderr, "    Final layer:   %.1f ms (%.1f%%)\n",
+                flux_timing_transformer_final, 100.0 * flux_timing_transformer_final / total_tf);
+        fprintf(stderr, "    Total:         %.1f ms\n", flux_timing_transformer_total);
+        fprintf(stderr, "    CUDA GEMM calls: %llu\n", (unsigned long long)flux_get_cuda_gemm_counter());
+    }
 
     flux_transformer_set_scratch_return_mode(tf, 0);
     return z_curr;
@@ -351,11 +399,11 @@ float *flux_sample_euler_with_refs(void *transformer, void *text_encoder,
 
     /* Print timing summary */
     double total_denoising = get_time_ms() - total_denoising_start;
-    fprintf(stderr, "\nDenoising timing breakdown (img2img with refs):\n");
+    if (g_timing_enabled) fprintf(stderr, "\nDenoising timing breakdown (img2img with refs):\n");
     for (int step = 0; step < num_steps; step++) {
-        fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+        if (g_timing_enabled) fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
     }
-    fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
+    if (g_timing_enabled) fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
 
     flux_transformer_set_scratch_return_mode(tf, 0);
     return z_curr;
@@ -417,9 +465,9 @@ float *flux_sample_euler_with_multi_refs(void *transformer, void *text_encoder,
     }
 
     double total_denoising = get_time_ms() - total_denoising_start;
-    fprintf(stderr, "\nDenoising timing breakdown (multi-ref, %d refs):\n", num_refs);
+    if (g_timing_enabled) fprintf(stderr, "\nDenoising timing breakdown (multi-ref, %d refs):\n", num_refs);
     for (int step = 0; step < num_steps; step++) {
-        fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
+        if (g_timing_enabled) fprintf(stderr, "  Step %d: %.1f ms\n", step + 1, step_times[step]);
     }
     fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
 
