@@ -9,6 +9,7 @@
 #include "flux_kernels.h"
 #include "flux_safetensors.h"
 #include "flux_qwen3.h"
+#include "embcache.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -115,6 +116,12 @@ struct flux_ctx {
     /* Generation behavior */
     int strict_mode;
     int warned_missing_embeddings;
+
+    /* Prompt embedding cache */
+    emb_cache_t *emb_cache;
+    int embed_cache_enabled;
+    char tokenizer_config_id[80];
+    char model_revision_id[80];
 };
 
 /* Global error message */
@@ -143,6 +150,77 @@ static int file_exists(const char *path) {
     return stat(path, &st) == 0;
 }
 
+
+static uint64_t fnv1a_bytes(const unsigned char *data, size_t n) {
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < n; i++) {
+        h ^= data[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static uint64_t hash_file_contents(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned char buf[4096];
+    uint64_t h = 14695981039346656037ULL;
+    for (;;) {
+        size_t n = fread(buf, 1, sizeof(buf), f);
+        if (n > 0) {
+            for (size_t i = 0; i < n; i++) {
+                h ^= buf[i];
+                h *= 1099511628211ULL;
+            }
+        }
+        if (n < sizeof(buf)) break;
+    }
+    fclose(f);
+    return h;
+}
+
+static void init_model_ids(flux_ctx *ctx, const char *model_dir) {
+    char path[1024];
+
+    snprintf(path, sizeof(path), "%s/tokenizer/tokenizer_config.json", model_dir);
+    uint64_t tok_hash = hash_file_contents(path);
+    if (tok_hash == 0) {
+        snprintf(path, sizeof(path), "%s/tokenizer/tokenizer.json", model_dir);
+        tok_hash = hash_file_contents(path);
+    }
+    if (tok_hash == 0) tok_hash = fnv1a_bytes((const unsigned char *)"unknown", 7);
+    snprintf(ctx->tokenizer_config_id, sizeof(ctx->tokenizer_config_id), "tokcfg:%016llx",
+             (unsigned long long)tok_hash);
+
+    const char *env_rev = getenv("FLUX_MODEL_REVISION");
+    if (env_rev && env_rev[0]) {
+        strncpy(ctx->model_revision_id, env_rev, sizeof(ctx->model_revision_id) - 1);
+        return;
+    }
+
+    snprintf(path, sizeof(path), "%s/REVISION", model_dir);
+    FILE *rf = fopen(path, "r");
+    if (!rf) {
+        snprintf(path, sizeof(path), "%s/.revision", model_dir);
+        rf = fopen(path, "r");
+    }
+    if (rf) {
+        if (fgets(ctx->model_revision_id, sizeof(ctx->model_revision_id), rf)) {
+            size_t len = strlen(ctx->model_revision_id);
+            while (len > 0 &&
+                  (ctx->model_revision_id[len - 1] == '\n' ||
+                   ctx->model_revision_id[len - 1] == '\r')) {
+                ctx->model_revision_id[--len] = '\0';
+            }
+        }
+        fclose(rf);
+    }
+
+    if (ctx->model_revision_id[0] == '\0') {
+        strncpy(ctx->model_revision_id, "unknown", sizeof(ctx->model_revision_id) - 1);
+    }
+}
+
 flux_ctx *flux_load_dir(const char *model_dir) {
     char path[1024];
 
@@ -159,6 +237,9 @@ flux_ctx *flux_load_dir(const char *model_dir) {
     strncpy(ctx->model_name, "FLUX.2-klein-4B", sizeof(ctx->model_name) - 1);
     strncpy(ctx->model_version, "1.0", sizeof(ctx->model_version) - 1);
     strncpy(ctx->model_dir, model_dir, sizeof(ctx->model_dir) - 1);
+    ctx->emb_cache = emb_lru_create(8);
+    ctx->embed_cache_enabled = 1;
+    init_model_ids(ctx, model_dir);
 
     /* Load VAE only at startup (~300MB).
      * Transformer and text encoder are loaded on-demand during generation
@@ -201,6 +282,7 @@ void flux_free(flux_ctx *ctx) {
     qwen3_encoder_free(ctx->qwen3_encoder);
     flux_vae_free(ctx->vae);
     flux_transformer_free(ctx->transformer);
+    emb_lru_destroy(ctx->emb_cache);
 
     free(ctx);
 }
@@ -211,6 +293,12 @@ void flux_set_mmap(flux_ctx *ctx, int enable) {
 
 void flux_set_strict(flux_ctx *ctx, int enable) {
     if (ctx) ctx->strict_mode = enable ? 1 : 0;
+}
+
+void flux_set_embed_cache(flux_ctx *ctx, int enable) {
+    if (!ctx) return;
+    ctx->embed_cache_enabled = enable ? 1 : 0;
+    if (ctx->emb_cache) emb_lru_set_enabled(ctx->emb_cache, ctx->embed_cache_enabled);
 }
 
 void flux_release_text_encoder(flux_ctx *ctx) {
@@ -270,6 +358,20 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
         return NULL;
     }
 
+    if (ctx->embed_cache_enabled && ctx->emb_cache) {
+        float *cached = NULL;
+        int cached_seq = 0, cached_dim = 0;
+        if (emb_lru_lookup(ctx->emb_cache, prompt,
+                             ctx->tokenizer_config_id, ctx->model_revision_id,
+                             &cached, &cached_seq, &cached_dim)) {
+            if (cached && cached_seq > 0 && cached_dim == QWEN3_TEXT_DIM) {
+                *out_seq_len = cached_seq;
+                return cached;
+            }
+            free(cached);
+        }
+    }
+
     /* Load encoder if not already loaded */
     if (!ctx->qwen3_encoder && ctx->model_dir[0]) {
         if (flux_phase_callback) flux_phase_callback("Loading Qwen3 encoder", 0);
@@ -314,6 +416,11 @@ float *flux_encode_text(flux_ctx *ctx, const char *prompt, int *out_seq_len) {
     }
 
     *out_seq_len = QWEN3_MAX_SEQ_LEN;  /* Always 512 */
+    if (ctx->embed_cache_enabled && ctx->emb_cache) {
+        emb_lru_store(ctx->emb_cache, prompt,
+                        ctx->tokenizer_config_id, ctx->model_revision_id,
+                        embeddings, QWEN3_MAX_SEQ_LEN, QWEN3_TEXT_DIM);
+    }
     return embeddings;
 }
 
@@ -939,114 +1046,4 @@ float *flux_denoise_step(flux_ctx *ctx, const float *z, float t,
     return flux_transformer_forward(ctx->transformer,
                                     z, latent_h, latent_w,
                                     text_emb, text_len, t);
-}
-
-/* Debug function: img2img with external inputs from Python */
-flux_image *flux_img2img_debug_py(flux_ctx *ctx, const flux_params *params) {
-    if (!ctx) {
-        set_error("Invalid context");
-        return NULL;
-    }
-
-    flux_params p;
-    if (params) {
-        p = *params;
-    } else {
-        p = (flux_params)FLUX_PARAMS_DEFAULT;
-    }
-
-    /* Load Python's noise */
-    FILE *f_noise = fopen("/tmp/py_noise.bin", "rb");
-    if (!f_noise) {
-        set_error("Cannot open /tmp/py_noise.bin");
-        return NULL;
-    }
-    fseek(f_noise, 0, SEEK_END);
-    int noise_size = ftell(f_noise) / sizeof(float);
-    fseek(f_noise, 0, SEEK_SET);
-    float *noise = (float *)malloc(noise_size * sizeof(float));
-    fread(noise, sizeof(float), noise_size, f_noise);
-    fclose(f_noise);
-    fprintf(stderr, "[DEBUG] Loaded noise: %d floats\n", noise_size);
-
-    /* Load Python's ref_latent */
-    FILE *f_ref = fopen("/tmp/py_ref_latent.bin", "rb");
-    if (!f_ref) {
-        free(noise);
-        set_error("Cannot open /tmp/py_ref_latent.bin");
-        return NULL;
-    }
-    fseek(f_ref, 0, SEEK_END);
-    int ref_size = ftell(f_ref) / sizeof(float);
-    fseek(f_ref, 0, SEEK_SET);
-    float *ref_latent = (float *)malloc(ref_size * sizeof(float));
-    fread(ref_latent, sizeof(float), ref_size, f_ref);
-    fclose(f_ref);
-    fprintf(stderr, "[DEBUG] Loaded ref_latent: %d floats\n", ref_size);
-
-    /* Load Python's text_emb */
-    FILE *f_txt = fopen("/tmp/py_text_emb.bin", "rb");
-    if (!f_txt) {
-        free(noise);
-        free(ref_latent);
-        set_error("Cannot open /tmp/py_text_emb.bin");
-        return NULL;
-    }
-    fseek(f_txt, 0, SEEK_END);
-    int txt_size = ftell(f_txt) / sizeof(float);
-    fseek(f_txt, 0, SEEK_SET);
-    float *text_emb = (float *)malloc(txt_size * sizeof(float));
-    fread(text_emb, sizeof(float), txt_size, f_txt);
-    fclose(f_txt);
-    int text_seq = 512;
-    fprintf(stderr, "[DEBUG] Loaded text_emb: %d floats (%d x %d)\n",
-            txt_size, text_seq, txt_size / text_seq);
-
-    /* Load transformer */
-    if (!flux_load_transformer_if_needed(ctx)) {
-        free(noise);
-        free(ref_latent);
-        free(text_emb);
-        return NULL;
-    }
-
-    /* Dimensions */
-    int latent_h = p.height / 16;
-    int latent_w = p.width / 16;
-    int image_seq_len = latent_h * latent_w;
-
-    /* Get schedule */
-    float *schedule = flux_official_schedule(p.num_steps, image_seq_len);
-
-    /* Sample with refs */
-    float *latent = flux_sample_euler_with_refs(
-        ctx->transformer, NULL,
-        noise, 1, FLUX_LATENT_CHANNELS, latent_h, latent_w,
-        ref_latent, latent_h, latent_w,
-        10,  /* t_offset */
-        text_emb, text_seq,
-        schedule, p.num_steps,
-        NULL  /* progress_callback */
-    );
-
-    free(noise);
-    free(ref_latent);
-    free(schedule);
-    free(text_emb);
-
-    if (!latent) {
-        set_error("Sampling failed");
-        return NULL;
-    }
-
-    /* Decode */
-    flux_image *result = NULL;
-    if (ctx->vae) {
-        if (flux_phase_callback) flux_phase_callback("decoding image", 0);
-        result = flux_vae_decode(ctx->vae, latent, 1, latent_h, latent_w);
-        if (flux_phase_callback) flux_phase_callback("decoding image", 1);
-    }
-
-    free(latent);
-    return result;
 }

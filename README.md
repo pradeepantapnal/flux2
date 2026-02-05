@@ -10,9 +10,9 @@ make mps       # Apple Silicon (fastest)
 # or: make blas    # Intel Mac / Linux with OpenBLAS
 # or: make generic # Pure C, no dependencies
 
-# Download the model (~16GB) - pick one:
-./download_model.sh                      # using curl
-# or: pip install huggingface_hub && python download_model.py
+# Download the pinned model revision and verify every file:
+python -m pip install huggingface_hub
+python download_model.py --manifest tools/model_manifest.json --output-dir flux-klein-model
 
 # Generate an image
 ./flux -d flux-klein-model -p "A woman wearing sunglasses" -o output.png
@@ -127,14 +127,14 @@ Generate images by typing prompts. Each image gets a `$N` reference ID:
 
 ```
 flux> a red sports car
-Done -> /tmp/flux-.../image-0001.png (ref $0)
+Done -> /tmp/flux-.../image-0001.png (ref $1)
 
 flux> a tropical beach
-Done -> /tmp/flux-.../image-0002.png (ref $1)
+Done -> /tmp/flux-.../image-0002.png (ref $2)
 
-flux> $0 $1 combine them
+flux> $1 $2 combine them
 Generating 256x256 (multi-ref, 2 images)...
-Done -> /tmp/flux-.../image-0003.png (ref $2)
+Done -> /tmp/flux-.../image-0003.png (ref $3)
 ```
 
 **Prompt syntax:**
@@ -142,7 +142,7 @@ Done -> /tmp/flux-.../image-0003.png (ref $2)
 - `512x512 prompt` - set size inline
 - `$ prompt` - img2img with last image
 - `$N prompt` - img2img with reference $N
-- `$0 $3 prompt` - multi-reference (combine images)
+- `$1 $3 prompt` - multi-reference (combine images)
 
 **Commands:** `!help`, `!save`, `!load`, `!seed`, `!size`, `!steps`, `!explore`, `!show`, `!quit`
 
@@ -182,15 +182,16 @@ Done -> /tmp/flux-.../image-0003.png (ref $2)
     --no-mmap         Disable mmap, load all weights upfront
 -e, --embeddings PATH Load pre-computed text embeddings (advanced)
     --strict          Fail if prompt embeddings are unavailable
+    --no-embed-cache Disable prompt embedding cache
 -h, --help            Show help
 ```
 
 
 ### Strict mode
 
-By default, if the Qwen3 text encoder cannot be loaded or prompt encoding fails, FLUX falls back to zero embeddings and prints a warning once per process.
+By default, if the Qwen3 text encoder cannot be loaded or prompt encoding fails, FLUX falls back to zero embeddings and prints a warning once per process. Prompt embeddings are cached by default for repeated prompts.
 
-Use `--strict` to disable this fallback. In strict mode, generation exits nonzero with a clear error if embeddings are unavailable.
+Use `--strict` to disable this fallback. In strict mode, generation exits nonzero with a clear error if embeddings are unavailable. Use `--no-embed-cache` to disable prompt embedding cache if needed for testing.
 
 ```bash
 ./flux -d flux-klein-model -p "a landscape" -o out.png --strict
@@ -290,24 +291,26 @@ python3 run_test.py --flux-binary ./flux --model-dir /path/to/model
 
 ## Model Download
 
-Download the model weights (~16GB) from HuggingFace using one of these methods:
+Use the manifest-pinned downloader for reproducible model setup.
 
-**Option 1: Shell script (requires curl)**
 ```bash
-./download_model.sh
+python -m pip install huggingface_hub
+python download_model.py --manifest tools/model_manifest.json --output-dir flux-klein-model
 ```
 
-**Option 2: Python script (requires huggingface_hub)**
-```bash
-pip install huggingface_hub
-python download_model.py
-```
+`tools/model_manifest.json` defines:
+- `repo_id`
+- exact `revision`
+- exact file list with `sha256` and `size`
 
-Both download the same files to `./flux-klein-model`:
-- VAE (~300MB)
-- Transformer (~4GB)
-- Qwen3-4B Text Encoder (~8GB)
-- Tokenizer
+The downloader fails hard if any downloaded file differs from the manifest.
+
+Why pinning matters:
+- **Reproducibility:** everyone uses the exact same model bits
+- **Integrity:** sha256 verification catches corruption and tampering
+- **Debuggability:** failures are deterministic across machines and CI
+
+After a successful verified download, files are in `./flux-klein-model`.
 
 ## How Fast Is It?
 
@@ -571,7 +574,8 @@ typedef struct {
 
 ### Comparing with Python Reference
 
-When debugging img2img issues, the `--debug-py` flag allows you to run the C implementation with exact inputs saved from a Python reference script. This isolates whether differences are due to input preparation (VAE encoding, text encoding, noise generation) or the transformer itself.
+Debug-only Python artifact generation now lives outside the runtime path under `tools/debug/`.
+The default `./flux` build does not read `/tmp/py_*.bin` files.
 
 **Setup:**
 
@@ -587,33 +591,22 @@ pip install torch diffusers transformers safetensors einops huggingface_hub
 git clone https://github.com/black-forest-labs/flux flux2
 ```
 
-3. Run the Python debug script to save inputs:
+3. Run the Python debug script to save artifacts:
 ```bash
-python debug/debug_img2img_compare.py
+python tools/debug/debug_img2img_compare.py
 ```
 
-This saves to `/tmp/`:
+This saves debug artifacts under `tools/debug/artifacts/` by default:
 - `py_noise.bin` - Initial noise tensor
 - `py_ref_latent.bin` - VAE-encoded reference image
 - `py_text_emb.bin` - Text embeddings from Qwen3
-
-4. Run C with the same inputs:
-```bash
-./flux -d flux-klein-model --debug-py -W 256 -H 256 --steps 4 -o /tmp/c_debug.png
-```
-
-5. Compare the outputs visually or numerically.
-
-**What this helps diagnose:**
-- If C and Python produce identical outputs with identical inputs, any differences in normal operation are due to input preparation (VAE, text encoder, RNG)
-- If outputs differ even with identical inputs, the issue is in the transformer or sampling implementation
+- `py_result.bin` - Final latent result
 
 ### Debug Scripts
 
-The `debug/` directory contains Python scripts for comparing C and Python implementations:
+The `tools/debug/` directory contains Python scripts for comparing C and Python implementations:
 
 - `debug_img2img_compare.py` - Full img2img comparison with step-by-step statistics
-- `debug_rope_img2img.py` - Verify RoPE position encoding matches between C and Python
 
 ## License
 

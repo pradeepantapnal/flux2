@@ -230,9 +230,8 @@ static void display_image(const char *path) {
     }
     if (state.open_enabled) {
 #ifdef __APPLE__
-        char cmd[CLI_MAX_PATH + 16];
-        snprintf(cmd, sizeof(cmd), "open \"%s\" 2>/dev/null &", path);
-        system(cmd);
+        printf("Open image: %s\n", path);
+        printf("Tip: run 'open \"%s\"' to launch it in Preview.\n", path);
 #endif
     }
 }

@@ -11,8 +11,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install BLAS dependency
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
       - name: Build generic backend
         run: make generic
 
-      - name: Smoke mode (no weights)
+      - name: Smoke mode (generic, no weights)
+        run: ./flux --smoke
+
+      - name: Build BLAS backend
+        run: make blas
+
+      - name: Smoke mode (BLAS, no weights)
         run: ./flux --smoke

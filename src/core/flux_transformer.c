@@ -257,6 +257,12 @@ typedef struct flux_transformer {
     float *double_img_attn_out;     /* [max_seq, hidden] */
     float *double_txt_attn_out;     /* [max_seq, hidden] */
 
+    /* Scratch arena to reduce hot-path allocator churn */
+    unsigned char *scratch_buf;
+    size_t scratch_cap;
+    size_t scratch_off;
+    int scratch_return_mode;  /* when set, forward returns scratch-backed output */
+
     /* Mmap mode: keep safetensors file open, load block weights on-demand */
     int use_mmap;
     safetensors_file_t *sf;
@@ -267,6 +273,31 @@ void flux_transformer_free(flux_transformer_t *tf);
 static int load_double_block_weights(double_block_t *b, safetensors_file_t *sf, int idx, int h, int mlp, int use_bf16);
 static void free_double_block_weights(double_block_t *b);
 static int load_single_block_weights(single_block_t *b, safetensors_file_t *sf, int idx, int h, int mlp, int use_bf16);
+
+static void transformer_scratch_reset(flux_transformer_t *tf) {
+    tf->scratch_off = 0;
+}
+
+static void *transformer_scratch_alloc(flux_transformer_t *tf, size_t size, size_t alignment) {
+    if (alignment == 0) alignment = 8;
+    size_t off = (tf->scratch_off + alignment - 1) & ~(alignment - 1);
+    size_t need = off + size;
+    if (need > tf->scratch_cap) {
+        size_t new_cap = tf->scratch_cap ? tf->scratch_cap : (1u << 20);
+        while (new_cap < need) new_cap *= 2;
+        unsigned char *nb = (unsigned char *)realloc(tf->scratch_buf, new_cap);
+        if (!nb) return NULL;
+        tf->scratch_buf = nb;
+        tf->scratch_cap = new_cap;
+    }
+    void *ptr = tf->scratch_buf + off;
+    tf->scratch_off = need;
+    return ptr;
+}
+
+void flux_transformer_set_scratch_return_mode(flux_transformer_t *tf, int enable) {
+    if (tf) tf->scratch_return_mode = enable ? 1 : 0;
+}
 static void free_single_block_weights(single_block_t *b);
 
 /* ========================================================================
@@ -990,6 +1021,10 @@ static int ensure_work_buffers(flux_transformer_t *tf, int total_seq) {
         !tf->single_concat || !tf->ffn_gate || !tf->ffn_up ||
         !tf->double_img_attn_out || !tf->double_txt_attn_out) {
         tf->work_seq_alloc = 0;
+    tf->scratch_buf = NULL;
+    tf->scratch_cap = 0;
+    tf->scratch_off = 0;
+    tf->scratch_return_mode = 0;
         return -1;
     }
 
@@ -2591,7 +2626,12 @@ cleanup:
 
     if (output_nlc) free(output_nlc);
 
-    return output;
+    if (tf->scratch_return_mode) return output;
+
+    float *heap_out = (float *)malloc((size_t)img_seq * tf->latent_channels * sizeof(float));
+    if (!heap_out) return NULL;
+    memcpy(heap_out, output, (size_t)img_seq * tf->latent_channels * sizeof(float));
+    return heap_out;
 }
 #endif /* USE_METAL */
 
@@ -2726,7 +2766,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     int img_seq = img_h * img_w;
     int head_dim = tf->head_dim;
     int axis_dim = 32;  /* FLUX uses axes_dims_rope: [32, 32, 32, 32] */
-
+    transformer_scratch_reset(tf);
     /* Ensure work buffers are sized for actual sequence length */
     int total_seq = img_seq + txt_seq;
     if (ensure_work_buffers(tf, total_seq) < 0) {
@@ -2743,7 +2783,8 @@ float *flux_transformer_forward(flux_transformer_t *tf,
      * Use t_emb_silu as work buffer (it's not used until double blocks)
      */
     int sincos_dim = tf->time_embed.sincos_dim;
-    float *t_emb = (float *)malloc(hidden * sizeof(float));
+    float *t_emb = (float *)transformer_scratch_alloc(tf, (size_t)hidden * sizeof(float), 64);
+    if (!t_emb) return NULL;
     float t_sincos[256];  /* sincos_dim is always 256 */
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
@@ -2752,15 +2793,19 @@ float *flux_transformer_forward(flux_transformer_t *tf,
      * img_h, img_w are the patch grid dimensions (e.g., 4x4 for 64x64 image)
      */
     /* Allocate RoPE: 4 axes * 32 dims = 128 dims per position (matches head_dim) */
-    float *img_rope_cos = (float *)malloc(img_seq * axis_dim * 4 * sizeof(float));
-    float *img_rope_sin = (float *)malloc(img_seq * axis_dim * 4 * sizeof(float));
+    float *img_rope_cos = (float *)transformer_scratch_alloc(tf, (size_t)img_seq * axis_dim * 4 * sizeof(float), 64);
+    if (!img_rope_cos) return NULL;
+    float *img_rope_sin = (float *)transformer_scratch_alloc(tf, (size_t)img_seq * axis_dim * 4 * sizeof(float), 64);
+    if (!img_rope_sin) return NULL;
     compute_rope_2d(img_rope_cos, img_rope_sin, img_h, img_w, axis_dim, tf->rope_theta);
 
     /* Compute text RoPE frequencies - text tokens have position IDs (0, 0, 0, L)
      * where L is the sequence index. RoPE is applied in axis 3 (dims 96-127)
      */
-    float *txt_rope_cos = (float *)malloc(txt_seq * head_dim * sizeof(float));
-    float *txt_rope_sin = (float *)malloc(txt_seq * head_dim * sizeof(float));
+    float *txt_rope_cos = (float *)transformer_scratch_alloc(tf, (size_t)txt_seq * head_dim * sizeof(float), 64);
+    if (!txt_rope_cos) return NULL;
+    float *txt_rope_sin = (float *)transformer_scratch_alloc(tf, (size_t)txt_seq * head_dim * sizeof(float), 64);
+    if (!txt_rope_sin) return NULL;
     compute_rope_text(txt_rope_cos, txt_rope_sin, txt_seq, axis_dim, tf->rope_theta);
 
     /* Transpose input from NCHW [channels, h, w] to NLC [seq, channels] format
@@ -2768,7 +2813,8 @@ float *flux_transformer_forward(flux_transformer_t *tf,
      * Output: transposed[pos * channels + c]
      */
     int channels = tf->latent_channels;
-    float *img_transposed = (float *)malloc(img_seq * channels * sizeof(float));
+    float *img_transposed = (float *)transformer_scratch_alloc(tf, (size_t)img_seq * channels * sizeof(float), 64);
+    if (!img_transposed) return NULL;
     for (int pos = 0; pos < img_seq; pos++) {
         for (int c = 0; c < channels; c++) {
             img_transposed[pos * channels + c] = img_latent[c * img_seq + pos];
@@ -2789,12 +2835,6 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                                                            img_rope_cos, img_rope_sin,
                                                            txt_rope_cos, txt_rope_sin);
         if (bf16_output) {
-            free(img_transposed);
-            free(t_emb);
-            free(img_rope_cos);
-            free(img_rope_sin);
-            free(txt_rope_cos);
-            free(txt_rope_sin);
             return bf16_output;
         } else {
             BF16_DEBUG("[BF16] bf16 pipeline failed, falling back\n");
@@ -2810,7 +2850,6 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     float *img_hidden = tf->img_hidden;
     LINEAR_BF16_OR_F32(img_hidden, img_transposed, tf->img_in_weight, tf->img_in_weight_bf16,
                        img_seq, tf->latent_channels, hidden);
-    free(img_transposed);
 
     /* Project text embeddings to hidden */
     float *txt_hidden = tf->txt_hidden;
@@ -2897,7 +2936,8 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     /* Concatenate text and image for single-stream blocks
      * Python uses [txt, img] order for concatenation
      */
-    float *concat_hidden = (float *)malloc(total_seq * hidden * sizeof(float));
+    float *concat_hidden = (float *)transformer_scratch_alloc(tf, (size_t)total_seq * hidden * sizeof(float), 64);
+    if (!concat_hidden) return NULL;
     memcpy(concat_hidden, txt_hidden, txt_seq * hidden * sizeof(float));
     memcpy(concat_hidden + txt_seq * hidden, img_hidden,
            img_seq * hidden * sizeof(float));
@@ -3119,7 +3159,6 @@ float *flux_transformer_forward(flux_transformer_t *tf,
 
     /* Extract image hidden states (image is after text) */
     memcpy(img_hidden, concat_hidden + txt_seq * hidden, img_seq * hidden * sizeof(float));
-    free(concat_hidden);
 
 #ifdef DEBUG_FINAL_LAYER
     fprintf(stderr, "[FINAL] Before final layer img_hidden[0,0,:5]: ");
@@ -3149,7 +3188,8 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     float *final_norm = tf->work1;
     apply_adaln(final_norm, img_hidden, final_shift, final_scale, img_seq, hidden, 1e-6f);
 
-    float *output_nlc = (float *)malloc(img_seq * tf->latent_channels * sizeof(float));
+    float *output_nlc = (float *)transformer_scratch_alloc(tf, (size_t)img_seq * tf->latent_channels * sizeof(float), 64);
+    if (!output_nlc) return NULL;
     LINEAR_BF16_OR_F32(output_nlc, final_norm, tf->final_proj_weight, tf->final_proj_weight_bf16,
                        img_seq, hidden, tf->latent_channels);
 
@@ -3157,19 +3197,14 @@ float *flux_transformer_forward(flux_transformer_t *tf,
      * Input: output_nlc[pos * channels + c]
      * Output: output[c * img_seq + pos]
      */
-    float *output = (float *)malloc(img_seq * tf->latent_channels * sizeof(float));
+    float *output = (float *)transformer_scratch_alloc(tf, (size_t)img_seq * tf->latent_channels * sizeof(float), 64);
+    if (!output) return NULL;
     for (int pos = 0; pos < img_seq; pos++) {
         for (int c = 0; c < channels; c++) {
             output[c * img_seq + pos] = output_nlc[pos * channels + c];
         }
     }
-    free(output_nlc);
 
-    free(t_emb);
-    free(img_rope_cos);
-    free(img_rope_sin);
-    free(txt_rope_cos);
-    free(txt_rope_sin);
 
     double final_time = tf_get_time_ms() - final_start;
 
@@ -3189,7 +3224,12 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     flux_gpu_sync();
 #endif
 
-    return output;
+    if (tf->scratch_return_mode) return output;
+
+    float *heap_out = (float *)malloc((size_t)img_seq * tf->latent_channels * sizeof(float));
+    if (!heap_out) return NULL;
+    memcpy(heap_out, output, (size_t)img_seq * tf->latent_channels * sizeof(float));
+    return heap_out;
 }
 
 /* ========================================================================
@@ -3237,6 +3277,7 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
     int head_dim = tf->head_dim;
     int axis_dim = 32;
     int channels = tf->latent_channels;
+    transformer_scratch_reset(tf);
 
     /* Ensure work buffers are sized for combined sequence */
     int total_seq = combined_img_seq + txt_seq;
@@ -3251,42 +3292,48 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
 
     /* Get timestep embedding */
     int sincos_dim = tf->time_embed.sincos_dim;
-    float *t_emb = (float *)malloc(hidden * sizeof(float));
+    float *t_emb = (float *)transformer_scratch_alloc(tf, (size_t)hidden * sizeof(float), 64);
+    if (!t_emb) return NULL;
     float t_sincos[256];
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
 
     /* Compute RoPE for target image (T=0) */
-    float *img_rope_cos = (float *)malloc(img_seq * axis_dim * 4 * sizeof(float));
-    float *img_rope_sin = (float *)malloc(img_seq * axis_dim * 4 * sizeof(float));
+    float *img_rope_cos = (float *)transformer_scratch_alloc(tf, (size_t)img_seq * axis_dim * 4 * sizeof(float), 64);
+    if (!img_rope_cos) return NULL;
+    float *img_rope_sin = (float *)transformer_scratch_alloc(tf, (size_t)img_seq * axis_dim * 4 * sizeof(float), 64);
+    if (!img_rope_sin) return NULL;
     compute_rope_2d(img_rope_cos, img_rope_sin, img_h, img_w, axis_dim, tf->rope_theta);
 
     /* Compute RoPE for reference image (T=t_offset) */
-    float *ref_rope_cos = (float *)malloc(ref_seq * axis_dim * 4 * sizeof(float));
-    float *ref_rope_sin = (float *)malloc(ref_seq * axis_dim * 4 * sizeof(float));
+    float *ref_rope_cos = (float *)transformer_scratch_alloc(tf, (size_t)ref_seq * axis_dim * 4 * sizeof(float), 64);
+    if (!ref_rope_cos) return NULL;
+    float *ref_rope_sin = (float *)transformer_scratch_alloc(tf, (size_t)ref_seq * axis_dim * 4 * sizeof(float), 64);
+    if (!ref_rope_sin) return NULL;
     compute_rope_2d_with_t_offset(ref_rope_cos, ref_rope_sin, ref_h, ref_w,
                                    axis_dim, tf->rope_theta, t_offset);
 
     /* Concatenate RoPE: [target, reference] */
-    float *combined_rope_cos = (float *)malloc(combined_img_seq * axis_dim * 4 * sizeof(float));
-    float *combined_rope_sin = (float *)malloc(combined_img_seq * axis_dim * 4 * sizeof(float));
+    float *combined_rope_cos = (float *)transformer_scratch_alloc(tf, (size_t)combined_img_seq * axis_dim * 4 * sizeof(float), 64);
+    if (!combined_rope_cos) return NULL;
+    float *combined_rope_sin = (float *)transformer_scratch_alloc(tf, (size_t)combined_img_seq * axis_dim * 4 * sizeof(float), 64);
+    if (!combined_rope_sin) return NULL;
     memcpy(combined_rope_cos, img_rope_cos, img_seq * axis_dim * 4 * sizeof(float));
     memcpy(combined_rope_cos + img_seq * axis_dim * 4, ref_rope_cos, ref_seq * axis_dim * 4 * sizeof(float));
     memcpy(combined_rope_sin, img_rope_sin, img_seq * axis_dim * 4 * sizeof(float));
     memcpy(combined_rope_sin + img_seq * axis_dim * 4, ref_rope_sin, ref_seq * axis_dim * 4 * sizeof(float));
 
-    free(img_rope_cos);
-    free(img_rope_sin);
-    free(ref_rope_cos);
-    free(ref_rope_sin);
 
     /* Compute text RoPE */
-    float *txt_rope_cos = (float *)malloc(txt_seq * head_dim * sizeof(float));
-    float *txt_rope_sin = (float *)malloc(txt_seq * head_dim * sizeof(float));
+    float *txt_rope_cos = (float *)transformer_scratch_alloc(tf, (size_t)txt_seq * head_dim * sizeof(float), 64);
+    if (!txt_rope_cos) return NULL;
+    float *txt_rope_sin = (float *)transformer_scratch_alloc(tf, (size_t)txt_seq * head_dim * sizeof(float), 64);
+    if (!txt_rope_sin) return NULL;
     compute_rope_text(txt_rope_cos, txt_rope_sin, txt_seq, axis_dim, tf->rope_theta);
 
     /* Transpose and concatenate image latents: [target, reference] */
-    float *combined_transposed = (float *)malloc(combined_img_seq * channels * sizeof(float));
+    float *combined_transposed = (float *)transformer_scratch_alloc(tf, (size_t)combined_img_seq * channels * sizeof(float), 64);
+    if (!combined_transposed) return NULL;
 
     /* Target image */
     for (int pos = 0; pos < img_seq; pos++) {
@@ -3302,10 +3349,10 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
     }
 
     /* Project combined image latent to hidden */
-    float *combined_hidden = (float *)malloc(combined_img_seq * hidden * sizeof(float));
+    float *combined_hidden = (float *)transformer_scratch_alloc(tf, (size_t)combined_img_seq * hidden * sizeof(float), 64);
+    if (!combined_hidden) return NULL;
     LINEAR_BF16_OR_F32(combined_hidden, combined_transposed, tf->img_in_weight, tf->img_in_weight_bf16,
                        combined_img_seq, tf->latent_channels, hidden);
-    free(combined_transposed);
 
     /* Project text embeddings to hidden */
     float *txt_hidden = tf->txt_hidden;
@@ -3344,10 +3391,10 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
     }
 
     /* Concatenate for single blocks: [txt, combined_img] */
-    float *concat_hidden = (float *)malloc(total_seq * hidden * sizeof(float));
+    float *concat_hidden = (float *)transformer_scratch_alloc(tf, (size_t)total_seq * hidden * sizeof(float), 64);
+    if (!concat_hidden) return NULL;
     memcpy(concat_hidden, txt_hidden, txt_seq * hidden * sizeof(float));
     memcpy(concat_hidden + txt_seq * hidden, combined_hidden, combined_img_seq * hidden * sizeof(float));
-    free(combined_hidden);
 
     /* Single blocks */
     for (int i = 0; i < tf->num_single_layers; i++) {
@@ -3369,9 +3416,9 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
     }
 
     /* Extract ONLY target image hidden states (first img_seq tokens after txt) */
-    float *img_hidden = (float *)malloc(img_seq * hidden * sizeof(float));
+    float *img_hidden = (float *)transformer_scratch_alloc(tf, (size_t)img_seq * hidden * sizeof(float), 64);
+    if (!img_hidden) return NULL;
     memcpy(img_hidden, concat_hidden + txt_seq * hidden, img_seq * hidden * sizeof(float));
-    free(concat_hidden);
 
     /* Final layer - only for target image tokens */
     for (int i = 0; i < hidden; i++) {
@@ -3387,26 +3434,21 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
 
     float *final_norm = tf->work1;
     apply_adaln(final_norm, img_hidden, final_shift, final_scale, img_seq, hidden, 1e-6f);
-    free(img_hidden);
 
-    float *output_nlc = (float *)malloc(img_seq * tf->latent_channels * sizeof(float));
+    float *output_nlc = (float *)transformer_scratch_alloc(tf, (size_t)img_seq * tf->latent_channels * sizeof(float), 64);
+    if (!output_nlc) return NULL;
     LINEAR_BF16_OR_F32(output_nlc, final_norm, tf->final_proj_weight, tf->final_proj_weight_bf16,
                        img_seq, hidden, tf->latent_channels);
 
     /* Transpose output from NLC to NCHW */
-    float *output = (float *)malloc(img_seq * tf->latent_channels * sizeof(float));
+    float *output = (float *)transformer_scratch_alloc(tf, (size_t)img_seq * tf->latent_channels * sizeof(float), 64);
+    if (!output) return NULL;
     for (int pos = 0; pos < img_seq; pos++) {
         for (int c = 0; c < channels; c++) {
             output[c * img_seq + pos] = output_nlc[pos * channels + c];
         }
     }
-    free(output_nlc);
 
-    free(t_emb);
-    free(combined_rope_cos);
-    free(combined_rope_sin);
-    free(txt_rope_cos);
-    free(txt_rope_sin);
 
     if (flux_substep_callback)
         flux_substep_callback(FLUX_SUBSTEP_FINAL_LAYER, 0, 1);
@@ -3415,7 +3457,12 @@ float *flux_transformer_forward_with_refs(flux_transformer_t *tf,
     flux_gpu_sync();
 #endif
 
-    return output;
+    if (tf->scratch_return_mode) return output;
+
+    float *heap_out = (float *)malloc((size_t)img_seq * tf->latent_channels * sizeof(float));
+    if (!heap_out) return NULL;
+    memcpy(heap_out, output, (size_t)img_seq * tf->latent_channels * sizeof(float));
+    return heap_out;
 }
 
 /* ========================================================================
@@ -3478,14 +3525,17 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
 
     /* Get timestep embedding */
     int sincos_dim = tf->time_embed.sincos_dim;
-    float *t_emb = (float *)malloc(hidden * sizeof(float));
+    float *t_emb = (float *)transformer_scratch_alloc(tf, (size_t)hidden * sizeof(float), 64);
+    if (!t_emb) return NULL;
     float t_sincos[256];
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
     time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
 
     /* Allocate combined RoPE arrays */
-    float *combined_rope_cos = (float *)malloc(combined_img_seq * axis_dim * 4 * sizeof(float));
-    float *combined_rope_sin = (float *)malloc(combined_img_seq * axis_dim * 4 * sizeof(float));
+    float *combined_rope_cos = (float *)transformer_scratch_alloc(tf, (size_t)combined_img_seq * axis_dim * 4 * sizeof(float), 64);
+    if (!combined_rope_cos) return NULL;
+    float *combined_rope_sin = (float *)transformer_scratch_alloc(tf, (size_t)combined_img_seq * axis_dim * 4 * sizeof(float), 64);
+    if (!combined_rope_sin) return NULL;
 
     /* Compute RoPE for target image (T=0) */
     compute_rope_2d(combined_rope_cos, combined_rope_sin, img_h, img_w, axis_dim, tf->rope_theta);
@@ -3502,12 +3552,15 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
     }
 
     /* Compute text RoPE */
-    float *txt_rope_cos = (float *)malloc(txt_seq * head_dim * sizeof(float));
-    float *txt_rope_sin = (float *)malloc(txt_seq * head_dim * sizeof(float));
+    float *txt_rope_cos = (float *)transformer_scratch_alloc(tf, (size_t)txt_seq * head_dim * sizeof(float), 64);
+    if (!txt_rope_cos) return NULL;
+    float *txt_rope_sin = (float *)transformer_scratch_alloc(tf, (size_t)txt_seq * head_dim * sizeof(float), 64);
+    if (!txt_rope_sin) return NULL;
     compute_rope_text(txt_rope_cos, txt_rope_sin, txt_seq, axis_dim, tf->rope_theta);
 
     /* Transpose and concatenate all image latents */
-    float *combined_transposed = (float *)malloc(combined_img_seq * channels * sizeof(float));
+    float *combined_transposed = (float *)transformer_scratch_alloc(tf, (size_t)combined_img_seq * channels * sizeof(float), 64);
+    if (!combined_transposed) return NULL;
 
     /* Target image */
     for (int pos = 0; pos < img_seq; pos++) {
@@ -3530,10 +3583,10 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
     }
 
     /* Project combined image latent to hidden */
-    float *combined_hidden = (float *)malloc(combined_img_seq * hidden * sizeof(float));
+    float *combined_hidden = (float *)transformer_scratch_alloc(tf, (size_t)combined_img_seq * hidden * sizeof(float), 64);
+    if (!combined_hidden) return NULL;
     LINEAR_BF16_OR_F32(combined_hidden, combined_transposed, tf->img_in_weight, tf->img_in_weight_bf16,
                        combined_img_seq, tf->latent_channels, hidden);
-    free(combined_transposed);
 
     /* Project text embeddings to hidden */
     float *txt_hidden = tf->txt_hidden;
@@ -3571,10 +3624,10 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
     }
 
     /* Concatenate for single blocks */
-    float *concat_hidden = (float *)malloc(total_seq * hidden * sizeof(float));
+    float *concat_hidden = (float *)transformer_scratch_alloc(tf, (size_t)total_seq * hidden * sizeof(float), 64);
+    if (!concat_hidden) return NULL;
     memcpy(concat_hidden, txt_hidden, txt_seq * hidden * sizeof(float));
     memcpy(concat_hidden + txt_seq * hidden, combined_hidden, combined_img_seq * hidden * sizeof(float));
-    free(combined_hidden);
 
     /* Single blocks */
     for (int i = 0; i < tf->num_single_layers; i++) {
@@ -3595,9 +3648,9 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
     }
 
     /* Extract ONLY target image hidden states */
-    float *img_hidden = (float *)malloc(img_seq * hidden * sizeof(float));
+    float *img_hidden = (float *)transformer_scratch_alloc(tf, (size_t)img_seq * hidden * sizeof(float), 64);
+    if (!img_hidden) return NULL;
     memcpy(img_hidden, concat_hidden + txt_seq * hidden, img_seq * hidden * sizeof(float));
-    free(concat_hidden);
 
     /* Final layer */
     for (int i = 0; i < hidden; i++) {
@@ -3613,26 +3666,21 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
 
     float *final_norm = tf->work1;
     apply_adaln(final_norm, img_hidden, final_shift, final_scale, img_seq, hidden, 1e-6f);
-    free(img_hidden);
 
-    float *output_nlc = (float *)malloc(img_seq * tf->latent_channels * sizeof(float));
+    float *output_nlc = (float *)transformer_scratch_alloc(tf, (size_t)img_seq * tf->latent_channels * sizeof(float), 64);
+    if (!output_nlc) return NULL;
     LINEAR_BF16_OR_F32(output_nlc, final_norm, tf->final_proj_weight, tf->final_proj_weight_bf16,
                        img_seq, hidden, tf->latent_channels);
 
     /* Transpose output from NLC to NCHW */
-    float *output = (float *)malloc(img_seq * tf->latent_channels * sizeof(float));
+    float *output = (float *)transformer_scratch_alloc(tf, (size_t)img_seq * tf->latent_channels * sizeof(float), 64);
+    if (!output) return NULL;
     for (int pos = 0; pos < img_seq; pos++) {
         for (int c = 0; c < channels; c++) {
             output[c * img_seq + pos] = output_nlc[pos * channels + c];
         }
     }
-    free(output_nlc);
 
-    free(t_emb);
-    free(combined_rope_cos);
-    free(combined_rope_sin);
-    free(txt_rope_cos);
-    free(txt_rope_sin);
 
     if (flux_substep_callback)
         flux_substep_callback(FLUX_SUBSTEP_FINAL_LAYER, 0, 1);
@@ -3641,7 +3689,12 @@ float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
     flux_gpu_sync();
 #endif
 
-    return output;
+    if (tf->scratch_return_mode) return output;
+
+    float *heap_out = (float *)malloc((size_t)img_seq * tf->latent_channels * sizeof(float));
+    if (!heap_out) return NULL;
+    memcpy(heap_out, output, (size_t)img_seq * tf->latent_channels * sizeof(float));
+    return heap_out;
 }
 
 /* ========================================================================
@@ -3757,6 +3810,10 @@ flux_transformer_t *flux_transformer_load(FILE *f) {
     tf->attn_scores = NULL;
     tf->attn_scores_alloc = 0;
     tf->work_seq_alloc = 0;
+    tf->scratch_buf = NULL;
+    tf->scratch_cap = 0;
+    tf->scratch_off = 0;
+    tf->scratch_return_mode = 0;
     tf->attn_cat_k = NULL;
     tf->attn_cat_v = NULL;
     tf->single_q = NULL;
@@ -4212,6 +4269,10 @@ flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf) {
     tf->attn_scores = NULL;
     tf->attn_scores_alloc = 0;
     tf->work_seq_alloc = 0;
+    tf->scratch_buf = NULL;
+    tf->scratch_cap = 0;
+    tf->scratch_off = 0;
+    tf->scratch_return_mode = 0;
     tf->attn_cat_k = NULL;
     tf->attn_cat_v = NULL;
     tf->single_q = NULL;

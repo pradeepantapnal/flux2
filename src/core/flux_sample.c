@@ -181,6 +181,7 @@ extern float *flux_transformer_forward_with_multi_refs(flux_transformer_t *tf,
                                                        const flux_ref_t *refs, int num_refs,
                                                        const float *txt_emb, int txt_seq,
                                                        float timestep);
+extern void flux_transformer_set_scratch_return_mode(flux_transformer_t *tf, int enable);
 
 /* VAE decode for step image callback */
 extern flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
@@ -209,13 +210,15 @@ float *flux_sample_euler(void *transformer, void *text_encoder,
     float *v_cond = NULL;
 
     flux_copy(z_curr, z, latent_size);
+    flux_transformer_set_scratch_return_mode(tf, 1);
 
     /* Reset timing counters */
     flux_reset_timing();
     double total_denoising_start = get_time_ms();
     double step_times[FLUX_MAX_STEPS];
-
+    const int scratch_timing = getenv("FLUX_SCRATCH_TIMING") != NULL;
     for (int step = 0; step < num_steps; step++) {
+        double scratch_step_t0 = scratch_timing ? get_time_ms() : 0.0;
         float t_curr = schedule[step];
         float t_next = schedule[step + 1];
         float dt = t_next - t_curr;  /* Negative for denoising */
@@ -233,12 +236,15 @@ float *flux_sample_euler(void *transformer, void *text_encoder,
         /* Euler step: z_next = z_curr + dt * v */
         flux_axpy(z_curr, dt, v_cond, latent_size);
 
-        free(v_cond);
 
         step_times[step] = get_time_ms() - step_start;
 
         if (progress_callback) {
             progress_callback(step + 1, num_steps);
+        }
+        if (scratch_timing) {
+            fprintf(stderr, "[SCRATCH] euler step %d/%d: %.2f ms\n",
+                    step + 1, num_steps, get_time_ms() - scratch_step_t0);
         }
 
         /* Step image callback - decode and display intermediate result */
@@ -268,6 +274,7 @@ float *flux_sample_euler(void *transformer, void *text_encoder,
             flux_timing_transformer_final, 100.0 * flux_timing_transformer_final / flux_timing_transformer_total);
     fprintf(stderr, "    Total:         %.1f ms\n", flux_timing_transformer_total);
 
+    flux_transformer_set_scratch_return_mode(tf, 0);
     return z_curr;
 }
 
@@ -296,12 +303,12 @@ float *flux_sample_euler_with_refs(void *transformer, void *text_encoder,
     /* Working buffer */
     float *z_curr = (float *)malloc(latent_size * sizeof(float));
     flux_copy(z_curr, z, latent_size);
+    flux_transformer_set_scratch_return_mode(tf, 1);
 
     /* Reset timing counters */
     flux_reset_timing();
     double total_denoising_start = get_time_ms();
     double step_times[FLUX_MAX_STEPS];
-
     for (int step = 0; step < num_steps; step++) {
         float t_curr = schedule[step];
         float t_next = schedule[step + 1];
@@ -324,7 +331,6 @@ float *flux_sample_euler_with_refs(void *transformer, void *text_encoder,
         /* Euler step: z_next = z_curr + dt * v */
         flux_axpy(z_curr, dt, v, latent_size);
 
-        free(v);
 
         step_times[step] = get_time_ms() - step_start;
 
@@ -351,6 +357,7 @@ float *flux_sample_euler_with_refs(void *transformer, void *text_encoder,
     }
     fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
 
+    flux_transformer_set_scratch_return_mode(tf, 0);
     return z_curr;
 }
 
@@ -374,7 +381,6 @@ float *flux_sample_euler_with_multi_refs(void *transformer, void *text_encoder,
     flux_reset_timing();
     double total_denoising_start = get_time_ms();
     double step_times[FLUX_MAX_STEPS];
-
     for (int step = 0; step < num_steps; step++) {
         float t_curr = schedule[step];
         float t_next = schedule[step + 1];
@@ -394,7 +400,6 @@ float *flux_sample_euler_with_multi_refs(void *transformer, void *text_encoder,
 
         /* Euler step */
         flux_axpy(z_curr, dt, v, latent_size);
-        free(v);
 
         step_times[step] = get_time_ms() - step_start;
 
@@ -418,6 +423,7 @@ float *flux_sample_euler_with_multi_refs(void *transformer, void *text_encoder,
     }
     fprintf(stderr, "  Total denoising: %.1f ms (%.2f s)\n", total_denoising, total_denoising / 1000.0);
 
+    flux_transformer_set_scratch_return_mode(tf, 0);
     return z_curr;
 }
 
@@ -438,6 +444,7 @@ float *flux_sample_euler_ancestral(void *transformer,
     float *noise = (float *)malloc(latent_size * sizeof(float));
 
     flux_copy(z_curr, z, latent_size);
+    flux_transformer_set_scratch_return_mode(tf, 1);
 
     for (int step = 0; step < num_steps; step++) {
         float t_curr = schedule[step];
@@ -458,7 +465,6 @@ float *flux_sample_euler_ancestral(void *transformer,
             flux_axpy(z_curr, sigma, noise, latent_size);
         }
 
-        free(v);
 
         if (progress_callback) {
             progress_callback(step + 1, num_steps);
@@ -476,6 +482,7 @@ float *flux_sample_euler_ancestral(void *transformer,
     }
 
     free(noise);
+    flux_transformer_set_scratch_return_mode(tf, 0);
     return z_curr;
 }
 
@@ -524,13 +531,11 @@ float *flux_sample_heun(void *transformer,
                 z_curr[i] += 0.5f * dt * (v1[i] + v2[i]);
             }
 
-            free(v2);
         } else {
             /* Last step: just use Euler */
             flux_axpy(z_curr, dt, v1, latent_size);
         }
 
-        free(v1);
 
         if (progress_callback) {
             progress_callback(step + 1, num_steps);
@@ -548,6 +553,7 @@ float *flux_sample_heun(void *transformer,
     }
 
     free(z_pred);
+    flux_transformer_set_scratch_return_mode(tf, 0);
     return z_curr;
 }
 

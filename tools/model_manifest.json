@@ -1,0 +1,41 @@
+{
+  "repo_id": "black-forest-labs/FLUX.2-klein-4B",
+  "revision": "main",
+  "files": [
+    {
+      "path": "vae/config.json",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000001",
+      "size": 0
+    },
+    {
+      "path": "vae/diffusion_pytorch_model.safetensors",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000002",
+      "size": 0
+    },
+    {
+      "path": "transformer/config.json",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000003",
+      "size": 0
+    },
+    {
+      "path": "transformer/diffusion_pytorch_model.safetensors",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000004",
+      "size": 0
+    },
+    {
+      "path": "text_encoder/config.json",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000005",
+      "size": 0
+    },
+    {
+      "path": "tokenizer/tokenizer.json",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000006",
+      "size": 0
+    },
+    {
+      "path": "tokenizer/tokenizer_config.json",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000007",
+      "size": 0
+    }
+  ]
+}
