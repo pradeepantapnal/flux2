@@ -225,6 +225,7 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "      --smoke, --no-weights\n                        Run no-weights smoke check and exit\n");
     fprintf(stderr, "      --timing          Print machine-readable JSON timing summary to stdout\n");
     fprintf(stderr, "      --strict          Fail if prompt embeddings are unavailable\n");
+    fprintf(stderr, "      --no-embed-cache Disable prompt embedding cache\n");
     fprintf(stderr, "  -e, --embeddings PATH Load pre-computed text embeddings\n");
     fprintf(stderr, "  -m, --mmap            Use memory-mapped weights (default, fastest on MPS)\n");
     fprintf(stderr, "      --no-mmap         Disable mmap, load all weights upfront\n");
@@ -268,11 +269,11 @@ int main(int argc, char *argv[]) {
         {"no-mmap",    no_argument,       0, 'M'},
         {"show",       no_argument,       0, 'k'},
         {"show-steps", no_argument,       0, 'K'},
-        {"debug-py",   no_argument,       0, 'D'},
         {"smoke",      no_argument,       0, 'x'},
         {"no-weights", no_argument,       0, 'x'},
         {"timing",     no_argument,       0, 't'},
         {"strict",     no_argument,       0, 'r'},
+        {"no-embed-cache", no_argument,   0, 1000},
         {0, 0, 0, 0}
     };
 
@@ -296,14 +297,14 @@ int main(int argc, char *argv[]) {
     int use_mmap = 1;  /* mmap is default (fastest on MPS) */
     int show_image = 0;
     int show_steps = 0;
-    int debug_py = 0;
     int smoke_mode = 0;
     int timing_output = 0;
     int strict_mode = 0;
+    int embed_cache_enabled = 1;
     term_graphics_proto graphics_proto = detect_terminal_graphics();
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:S:i:e:n:qvhVmMDkKtxr",
+    while ((opt = getopt_long(argc, argv, "d:p:o:W:H:s:S:i:e:n:qvhVmMkKtxr",
                               long_options, NULL)) != -1) {
         switch (opt) {
             case 'd': model_dir = optarg; break;
@@ -332,10 +333,10 @@ int main(int argc, char *argv[]) {
             case 'M': use_mmap = 0; break;
             case 'k': show_image = 1; break;
             case 'K': show_steps = 1; break;
-            case 'D': debug_py = 1; break;
             case 'x': smoke_mode = 1; break;
             case 't': timing_output = 1; break;
             case 'r': strict_mode = 1; break;
+            case 1000: embed_cache_enabled = 0; break;
             default:
                 print_usage(argv[0]);
                 return 1;
@@ -367,11 +368,11 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* Interactive mode: -d provided but no -p, -e, -o, or --debug-py */
-    int interactive_mode = (!prompt && !embeddings_path && !output_path && !debug_py);
+    /* Interactive mode: -d provided but no -p, -e, or -o */
+    int interactive_mode = (!prompt && !embeddings_path && !output_path);
 
     if (!interactive_mode) {
-        if (!prompt && !embeddings_path && !debug_py) {
+        if (!prompt && !embeddings_path) {
             fprintf(stderr, "Error: Prompt (-p) or embeddings file (-e) is required\n\n");
             print_usage(argv[0]);
             return 1;
@@ -440,6 +441,7 @@ int main(int argc, char *argv[]) {
         LOG_VERBOSE("  Using mmap mode for text encoder (lower memory)\n");
     }
     flux_set_strict(ctx, strict_mode);
+    flux_set_embed_cache(ctx, embed_cache_enabled);
 
     double load_time = timer_end();
     LOG_NORMAL(" done (%.1fs)\n", load_time);
@@ -472,11 +474,7 @@ int main(int argc, char *argv[]) {
     struct timeval total_start_tv;
     gettimeofday(&total_start_tv, NULL);
 
-    if (debug_py) {
-        /* ============== Debug mode: use Python inputs ============== */
-        LOG_NORMAL("Debug mode: loading Python inputs from /tmp/py_*.bin\n");
-        output = flux_img2img_debug_py(ctx, &params);
-    } else if (num_inputs > 0) {
+    if (num_inputs > 0) {
         /* ============== Image-to-image mode (single or multi-reference) ============== */
         LOG_NORMAL("Loading %d input image%s...", num_inputs, num_inputs > 1 ? "s" : "");
         if (output_level >= OUTPUT_NORMAL) fflush(stderr);

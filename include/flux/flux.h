@@ -131,6 +131,9 @@ void flux_set_mmap(flux_ctx *ctx, int enable);
  */
 void flux_set_strict(flux_ctx *ctx, int enable);
 
+/* Enable/disable prompt embedding cache (enabled by default). */
+void flux_set_embed_cache(flux_ctx *ctx, int enable);
+
 /*
  * Text-to-image generation.
  * Returns newly allocated image, caller must free with flux_image_free().
@@ -154,12 +157,6 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
 flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
                           const flux_image **refs, int num_refs,
                           const flux_params *params);
-
-/*
- * Debug: img2img using Python's exact inputs from /tmp/py_*.bin files.
- * Used for comparing C and Python implementations.
- */
-flux_image *flux_img2img_debug_py(flux_ctx *ctx, const flux_params *params);
 
 /*
  * Text-to-image generation with pre-computed embeddings.

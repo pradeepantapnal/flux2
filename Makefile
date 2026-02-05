@@ -1,29 +1,35 @@
 # FLUX.2 klein 4B - Pure C Inference Engine
-# Makefile
 
 CC = gcc
-CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math
+CFLAGS_BASE = -Wall -Wextra -O3 -march=native -ffast-math -Iinclude/flux
 LDFLAGS = -lm
 
-# Platform detection
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
-# Source files
-SRCS = flux.c flux_kernels.c flux_tokenizer.c flux_vae.c flux_transformer.c flux_sample.c flux_image.c flux_safetensors.c flux_qwen3.c flux_qwen3_tokenizer.c terminals.c
+CORE_SRCS = \
+	src/core/flux.c \
+	src/core/flux_kernels.c \
+	src/core/flux_tokenizer.c \
+	src/core/flux_vae.c \
+	src/core/flux_transformer.c \
+	src/core/flux_sample.c \
+	src/core/flux_image.c \
+	src/core/flux_safetensors.c \
+	src/core/flux_qwen3.c \
+	src/core/flux_qwen3_tokenizer.c \
+	src/core/terminals.c
+CLI_SRCS = src/cli/flux_cli.c src/core/linenoise.c src/core/embcache.c
+APP_SRCS = src/app/main.c
+SRCS = $(CORE_SRCS) $(CLI_SRCS) $(APP_SRCS)
 OBJS = $(SRCS:.c=.o)
-CLI_SRCS = flux_cli.c linenoise.c embcache.c
-CLI_OBJS = $(CLI_SRCS:.c=.o)
-MAIN = main.c
 TARGET = flux
 LIB = libflux.a
 
-# Debug build flags
-DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address
+DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address -Iinclude/flux
 
 .PHONY: all clean debug lib install info test pngtest help generic blas mps
 
-# Default: show available targets
 all: help
 
 help:
@@ -47,18 +53,12 @@ endif
 	@echo ""
 	@echo "Example: make mps && ./flux -d flux-klein-model -p \"a cat\" -o cat.png"
 
-# =============================================================================
-# Backend: generic (pure C, no BLAS)
-# =============================================================================
 generic: CFLAGS = $(CFLAGS_BASE) -DGENERIC_BUILD
 generic: clean $(TARGET)
 	@echo ""
 	@echo "Built with GENERIC backend (pure C, no BLAS)"
 	@echo "This will be slow but has zero dependencies."
 
-# =============================================================================
-# Backend: blas (Accelerate on macOS, OpenBLAS on Linux)
-# =============================================================================
 ifeq ($(UNAME_S),Darwin)
 blas: CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DACCELERATE_NEW_LAPACK
 blas: LDFLAGS += -framework Accelerate
@@ -70,9 +70,6 @@ blas: clean $(TARGET)
 	@echo ""
 	@echo "Built with BLAS backend (~30x faster than generic)"
 
-# =============================================================================
-# Backend: mps (Apple Silicon Metal GPU)
-# =============================================================================
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
 MPS_CFLAGS = $(CFLAGS_BASE) -DUSE_BLAS -DUSE_METAL -DACCELERATE_NEW_LAPACK
@@ -83,17 +80,16 @@ mps: clean mps-build
 	@echo ""
 	@echo "Built with MPS backend (Metal GPU acceleration)"
 
-mps-build: $(SRCS:.c=.mps.o) $(CLI_SRCS:.c=.mps.o) flux_metal.o main.mps.o
+mps-build: $(CORE_SRCS:.c=.mps.o) $(CLI_SRCS:.c=.mps.o) src/app/main.mps.o flux_metal.o
 	$(CC) $(MPS_CFLAGS) -o $(TARGET) $^ $(MPS_LDFLAGS)
 
-%.mps.o: %.c flux.h flux_kernels.h
+%.mps.o: %.c
 	$(CC) $(MPS_CFLAGS) -c -o $@ $<
 
-# Embed Metal shader source as C array (runtime compilation, no Metal toolchain needed)
 flux_shaders_source.h: flux_shaders.metal
 	xxd -i $< > $@
 
-flux_metal.o: flux_metal.m flux_metal.h flux_shaders_source.h
+flux_metal.o: flux_metal.m include/flux/flux_metal.h flux_shaders_source.h
 	$(CC) $(MPS_OBJCFLAGS) -c -o $@ $<
 
 else
@@ -107,28 +103,20 @@ mps:
 	@exit 1
 endif
 
-# =============================================================================
-# Build rules
-# =============================================================================
-$(TARGET): $(OBJS) $(CLI_OBJS) main.o
+$(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 lib: $(LIB)
-
-$(LIB): $(OBJS)
+$(LIB): $(CORE_SRCS:.c=.o)
 	ar rcs $@ $^
 
-%.o: %.c flux.h flux_kernels.h
+%.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# Debug build
 debug: CFLAGS = $(DEBUG_CFLAGS)
 debug: LDFLAGS += -fsanitize=address
 debug: clean $(TARGET)
 
-# =============================================================================
-# Test and utilities
-# =============================================================================
 test:
 	@python3 run_test.py --flux-binary ./$(TARGET)
 
@@ -137,7 +125,7 @@ test-quick:
 
 pngtest:
 	@echo "Running PNG compression compare test..."
-	@$(CC) $(CFLAGS_BASE) -I. png_compare.c flux_image.c -lm -o /tmp/flux_png_compare
+	@$(CC) $(CFLAGS_BASE) src/tools/png_compare.c src/core/flux_image.c -lm -o /tmp/flux_png_compare
 	@/tmp/flux_png_compare images/woman_with_sunglasses.png images/woman_with_sunglasses_compressed2.png
 	@/tmp/flux_png_compare images/cat_uncompressed.png images/cat_compressed.png
 	@rm -f /tmp/flux_png_compare
@@ -146,14 +134,14 @@ pngtest:
 install: $(TARGET) $(LIB)
 	install -d /usr/local/bin
 	install -d /usr/local/lib
-	install -d /usr/local/include
+	install -d /usr/local/include/flux
 	install -m 755 $(TARGET) /usr/local/bin/
 	install -m 644 $(LIB) /usr/local/lib/
-	install -m 644 flux.h /usr/local/include/
-	install -m 644 flux_kernels.h /usr/local/include/
+	install -m 644 include/flux/flux.h /usr/local/include/flux/
+	install -m 644 include/flux/flux_kernels.h /usr/local/include/flux/
 
 clean:
-	rm -f $(OBJS) $(CLI_OBJS) *.mps.o flux_metal.o main.o $(TARGET) $(LIB)
+	rm -f $(OBJS) $(CORE_SRCS:.c=.mps.o) $(CLI_SRCS:.c=.mps.o) src/app/main.mps.o flux_metal.o $(TARGET) $(LIB)
 	rm -f flux_shaders_source.h
 
 info:
@@ -170,22 +158,3 @@ endif
 else
 	@echo "  blas    - OpenBLAS (requires libopenblas-dev)"
 endif
-
-# =============================================================================
-# Dependencies
-# =============================================================================
-flux.o: flux.c flux.h flux_kernels.h flux_safetensors.h flux_qwen3.h
-flux_kernels.o: flux_kernels.c flux_kernels.h
-flux_tokenizer.o: flux_tokenizer.c flux.h
-flux_vae.o: flux_vae.c flux.h flux_kernels.h
-flux_transformer.o: flux_transformer.c flux.h flux_kernels.h
-flux_sample.o: flux_sample.c flux.h flux_kernels.h
-flux_image.o: flux_image.c flux.h
-flux_safetensors.o: flux_safetensors.c flux_safetensors.h
-flux_qwen3.o: flux_qwen3.c flux_qwen3.h flux_safetensors.h
-flux_qwen3_tokenizer.o: flux_qwen3_tokenizer.c flux_qwen3.h
-terminals.o: terminals.c terminals.h flux.h
-flux_cli.o: flux_cli.c flux_cli.h flux.h flux_qwen3.h embcache.h linenoise.h terminals.h
-linenoise.o: linenoise.c linenoise.h
-embcache.o: embcache.c embcache.h
-main.o: main.c flux.h flux_kernels.h flux_cli.h terminals.h

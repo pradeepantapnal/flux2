@@ -6,10 +6,10 @@ This script:
 1. Encodes a reference image using diffusers VAE + batch normalization
 2. Encodes a text prompt using Qwen3
 3. Runs the FLUX.2 transformer for denoising
-4. Saves intermediate values to /tmp/ for C comparison
+4. Saves intermediate values under tools/debug/artifacts for offline comparison
 
 Usage:
-    python debug/debug_img2img_compare.py
+    python tools/debug/debug_img2img_compare.py
 
 Prerequisites:
     pip install torch diffusers transformers safetensors einops huggingface_hub
@@ -17,18 +17,18 @@ Prerequisites:
     # Clone flux2 for the model class (into project root):
     git clone https://github.com/black-forest-labs/flux flux2
 
-    # Place a test image at /tmp/woman.png
+    # Place a test image at tools/debug/artifacts/woman.png
 
-After running, use C with --debug-py to compare:
-    ./flux -d flux-klein-model --debug-py -W 256 -H 256 --steps 4 -o /tmp/c_debug.png
+After running, compare the generated artifacts with your own debug tooling.
 """
 
+import argparse
 import os
 import sys
 
 # Add flux2/src to path for model imports
 script_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(script_dir)
+project_root = os.path.dirname(os.path.dirname(script_dir))
 flux2_path = os.path.join(project_root, "flux2", "src")
 if os.path.exists(flux2_path):
     sys.path.insert(0, flux2_path)
@@ -61,9 +61,17 @@ def inv_batch_norm(z, running_mean, running_var, eps=1e-4):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Generate Python-side img2img debug artifacts.")
+    parser.add_argument("--model-dir", default=os.path.join(project_root, "flux-klein-model"))
+    parser.add_argument("--input-image", default=os.path.join(project_root, "tools", "debug", "artifacts", "woman.png"))
+    parser.add_argument("--output-dir", default=os.path.join(project_root, "tools", "debug", "artifacts"))
+    args = parser.parse_args()
+
     # Configuration
-    model_dir = os.path.join(project_root, "flux-klein-model")
-    input_image = "/tmp/woman.png"
+    model_dir = args.model_dir
+    input_image = args.input_image
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
     width, height = 256, 256
     num_steps = 4
     seed = 1769049725
@@ -116,7 +124,7 @@ def main():
     print("\nEncoding reference image...")
     if not os.path.exists(input_image):
         print(f"Error: Input image not found: {input_image}")
-        print("Please place a test image at /tmp/woman.png")
+        print(f"Please place a test image at {input_image}")
         return
 
     input_img = Image.open(input_image).convert("RGB")
@@ -145,7 +153,7 @@ def main():
     print(f"Reference latent: first 8: {post_flat[:8]}")
 
     # Save for C comparison
-    ref_latent.float().cpu().numpy().astype(np.float32).tofile("/tmp/py_ref_latent.bin")
+    ref_latent.float().cpu().numpy().astype(np.float32).tofile(os.path.join(output_dir, "py_ref_latent.bin"))
 
     # Encode text using Qwen3
     print("\nEncoding text with Qwen3...")
@@ -187,7 +195,7 @@ def main():
     print(f"Text emb: mean={text_flat.mean():.4f}, std={text_flat.std():.4f}")
 
     # Save for C comparison
-    text_emb.float().cpu().numpy().astype(np.float32).tofile("/tmp/py_text_emb.bin")
+    text_emb.float().cpu().numpy().astype(np.float32).tofile(os.path.join(output_dir, "py_text_emb.bin"))
 
     # Initialize noise
     print(f"\nInitializing noise with seed {seed}...")
@@ -200,7 +208,7 @@ def main():
     print(f"  first 8: {z_flat[:8]}")
 
     # Save for C comparison
-    z.float().cpu().numpy().astype(np.float32).tofile("/tmp/py_noise.bin")
+    z.float().cpu().numpy().astype(np.float32).tofile(os.path.join(output_dir, "py_noise.bin"))
 
     # Prepare tokens
     print("\nPreparing tokens...")
@@ -249,7 +257,7 @@ def main():
     print(f"\nResult: mean={result_flat.mean():.6f}, std={result_flat.std():.6f}")
 
     # Save result for comparison
-    result.float().cpu().numpy().astype(np.float32).tofile("/tmp/py_result.bin")
+    result.float().cpu().numpy().astype(np.float32).tofile(os.path.join(output_dir, "py_result.bin"))
 
     # Decode
     print("\nDecoding...")
@@ -266,9 +274,9 @@ def main():
     decoded = decoded.transpose(1, 2, 0)
 
     output_img = Image.fromarray(decoded)
-    output_img.save("/tmp/py_woman_color.png")
-    print("Saved output to /tmp/py_woman_color.png")
-    print("\nFiles saved to /tmp/:")
+    output_img.save(os.path.join(output_dir, "py_woman_color.png"))
+    print(f"Saved output to {os.path.join(output_dir, 'py_woman_color.png')}")
+    print(f"\nFiles saved to {output_dir}:")
     print("  py_noise.bin      - Initial noise")
     print("  py_ref_latent.bin - VAE-encoded reference")
     print("  py_text_emb.bin   - Text embeddings")
