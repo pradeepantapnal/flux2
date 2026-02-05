@@ -35,6 +35,9 @@
 #ifdef USE_METAL
 #include "flux_metal.h"
 #endif
+#ifdef USE_CUDA
+#include "flux_cuda.h"
+#endif
 
 /* ========================================================================
  * Verbosity Levels
@@ -253,7 +256,8 @@ static const char *detect_mmap_mode(int use_mmap, int deterministic_mode) {
 
 static void print_startup_diagnostics(int use_mmap,
                                       int deterministic_mode,
-                                      int embed_cache_enabled) {
+                                      int embed_cache_enabled,
+                                      const char *selected_backend) {
     char thread_buf[64];
     const char *openblas_env = getenv("OPENBLAS_NUM_THREADS");
     const char *omp_env = getenv("OMP_NUM_THREADS");
@@ -272,13 +276,7 @@ static void print_startup_diagnostics(int use_mmap,
 
     fprintf(stderr,
             "startup: backend=%s (BLAS %s); vendor=%s; threads=%s; env[OMP_NUM_THREADS=%s OPENBLAS_NUM_THREADS=%s]; dtype[%s]; mmap=%s; embed_cache=%s\n",
-#ifdef USE_METAL
-            "metal",
-#elif defined(USE_BLAS)
-            "blas",
-#else
-            "generic",
-#endif
+            selected_backend,
             blas_enabled,
             blas_vendor,
             blas_threads,
@@ -384,6 +382,9 @@ static void print_usage(const char *prog) {
     fprintf(stderr, "      --show            Display image in terminal (auto-detects Kitty/Ghostty/iTerm2)\n");
     fprintf(stderr, "      --show-steps      Display each denoising step (slower)\n\n");
     fprintf(stderr, "Other options:\n");
+    fprintf(stderr, "      --backend cpu|cuda Choose execution backend (default: cpu)\n");
+    fprintf(stderr, "      --cuda-test       Run a tiny fp16 CUDA GEMM self-test and exit\n");
+    fprintf(stderr, "      --diag            Print backend/runtime diagnostics\n");
     fprintf(stderr, "      --smoke, --no-weights\n                        Run no-weights smoke check and exit\n");
     fprintf(stderr, "      --timing          Print machine-readable JSON timing summary to stdout\n");
     fprintf(stderr, "      --json-out PATH   Write timing JSON to file (requires --timing)\n");
@@ -410,10 +411,6 @@ static void print_usage(const char *prog) {
 int main(int argc, char *argv[]) {
 #ifdef USE_METAL
     flux_metal_init();
-#elif defined(USE_BLAS)
-    fprintf(stderr, "BLAS: CPU acceleration enabled (Accelerate/OpenBLAS)\n");
-#else
-    fprintf(stderr, "Generic: Pure C backend (no acceleration)\n");
 #endif
 
     /* Command line options */
@@ -444,6 +441,9 @@ int main(int argc, char *argv[]) {
         {"json-out",   required_argument, 0, 'j'},
         {"deterministic", no_argument,    0, 'D'},
         {"strict",     no_argument,       0, 'r'},
+        {"backend",    required_argument, 0, 1003},
+        {"cuda-test",  no_argument,       0, 1004},
+        {"diag",       no_argument,       0, 1005},
         {"no-embed-cache", no_argument,   0, 1000},
         {"embcache-dir", required_argument, 0, 1001},
         {0, 0, 0, 0}
@@ -457,6 +457,10 @@ int main(int argc, char *argv[]) {
     int num_inputs = 0;
     char *embeddings_path = NULL;
     char *noise_path = NULL;
+
+    const char *backend = "cpu";
+    int cuda_test_mode = 0;
+    int diag_mode = 0;
 
     flux_params params = {
         .width = DEFAULT_WIDTH,
@@ -519,10 +523,23 @@ int main(int argc, char *argv[]) {
             case 'r': strict_mode = 1; break;
             case 1000: embed_cache_enabled = 0; break;
             case 1001: embcache_dir = optarg; break;
+            case 1003: backend = optarg; break;
+            case 1004: cuda_test_mode = 1; break;
+            case 1005: diag_mode = 1; break;
             default:
                 print_usage(argv[0]);
                 return 1;
         }
+    }
+
+    if (strcmp(backend, "cuda") == 0) {
+        fprintf(stderr, "CUDA backend requested\n");
+    } else {
+#if defined(USE_BLAS)
+        fprintf(stderr, "BLAS: CPU acceleration enabled (Accelerate/OpenBLAS)\n");
+#else
+        fprintf(stderr, "Generic: Pure C backend (no acceleration)\n");
+#endif
     }
 
     if (deterministic_mode) {
@@ -530,9 +547,36 @@ int main(int argc, char *argv[]) {
         use_mmap = 0;
     }
 
-    int print_startup_line = (output_level >= OUTPUT_VERBOSE) || timing_output;
+    int print_startup_line = (output_level >= OUTPUT_VERBOSE) || timing_output || diag_mode;
     if (print_startup_line) {
-        print_startup_diagnostics(use_mmap, deterministic_mode, embed_cache_enabled);
+        print_startup_diagnostics(use_mmap, deterministic_mode, embed_cache_enabled, backend);
+    }
+
+    if (strcmp(backend, "cpu") != 0 && strcmp(backend, "cuda") != 0) {
+        fprintf(stderr, "Error: --backend must be one of: cpu, cuda\n");
+        return 1;
+    }
+
+    if (strcmp(backend, "cuda") == 0 || cuda_test_mode) {
+#ifndef USE_CUDA
+        fprintf(stderr, "Error: CUDA backend requested but binary was not built with USE_CUDA\n");
+        return 1;
+#else
+        if (flux_cuda_init(diag_mode || cuda_test_mode || output_level >= OUTPUT_VERBOSE) != 0) {
+            fprintf(stderr, "Error: Failed to initialize CUDA backend\n");
+            return 1;
+        }
+#endif
+    }
+
+    if (cuda_test_mode) {
+#ifdef USE_CUDA
+        int ok = flux_cuda_test_gemm();
+        flux_cuda_shutdown();
+        return ok == 0 ? 0 : 1;
+#else
+        return 1;
+#endif
     }
 
     if (smoke_mode) {
@@ -961,6 +1005,11 @@ int main(int argc, char *argv[]) {
 
 #ifdef USE_METAL
     flux_metal_cleanup();
+#endif
+#ifdef USE_CUDA
+    if (strcmp(backend, "cuda") == 0) {
+        flux_cuda_shutdown();
+    }
 #endif
 
     return 0;
