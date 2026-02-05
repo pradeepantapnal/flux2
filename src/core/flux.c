@@ -34,7 +34,6 @@ extern void flux_tokenizer_free(flux_tokenizer *tok);
 extern int *flux_tokenize(flux_tokenizer *tok, const char *text,
                           int *num_tokens, int max_len);
 
-extern flux_vae_t *flux_vae_load(FILE *f);
 extern flux_vae_t *flux_vae_load_safetensors(safetensors_file_t *sf);
 extern void flux_vae_free(flux_vae_t *vae);
 extern float *flux_vae_encode(flux_vae_t *vae, const float *img,
@@ -43,7 +42,6 @@ extern flux_image *flux_vae_decode(flux_vae_t *vae, const float *latent,
                                    int batch, int latent_h, int latent_w);
 extern float *flux_image_to_tensor(const flux_image *img);
 
-extern flux_transformer_t *flux_transformer_load(FILE *f);
 extern flux_transformer_t *flux_transformer_load_safetensors(safetensors_file_t *sf);
 extern flux_transformer_t *flux_transformer_load_safetensors_mmap(safetensors_file_t *sf);
 extern void flux_transformer_free(flux_transformer_t *tf);
@@ -1046,4 +1044,94 @@ float *flux_denoise_step(flux_ctx *ctx, const float *z, float t,
     return flux_transformer_forward(ctx->transformer,
                                     z, latent_h, latent_w,
                                     text_emb, text_len, t);
+}
+
+
+/* ========================================================================
+ * Finalized status-based API wrappers
+ * ======================================================================== */
+
+static flux_status_t flux_status_from_ptr(const void *p) {
+    return p ? FLUX_STATUS_OK : FLUX_STATUS_RUNTIME_ERROR;
+}
+
+flux_status_t flux_ctx_load(flux_ctx **out_ctx, const char *model_dir) {
+    if (!out_ctx || !model_dir) return FLUX_STATUS_INVALID_ARGUMENT;
+    *out_ctx = flux_load_dir(model_dir);
+    return flux_status_from_ptr(*out_ctx);
+}
+
+flux_status_t flux_ctx_free(flux_ctx *ctx) {
+    if (!ctx) return FLUX_STATUS_INVALID_ARGUMENT;
+    flux_free(ctx);
+    return FLUX_STATUS_OK;
+}
+
+flux_status_t flux_ctx_release_text_encoder(flux_ctx *ctx) {
+    if (!ctx) return FLUX_STATUS_INVALID_ARGUMENT;
+    flux_release_text_encoder(ctx);
+    return FLUX_STATUS_OK;
+}
+
+flux_status_t flux_ctx_set_mmap(flux_ctx *ctx, int enable) {
+    if (!ctx) return FLUX_STATUS_INVALID_ARGUMENT;
+    flux_set_mmap(ctx, enable);
+    return FLUX_STATUS_OK;
+}
+
+flux_status_t flux_ctx_set_strict(flux_ctx *ctx, int enable) {
+    if (!ctx) return FLUX_STATUS_INVALID_ARGUMENT;
+    flux_set_strict(ctx, enable);
+    return FLUX_STATUS_OK;
+}
+
+flux_status_t flux_ctx_set_embed_cache(flux_ctx *ctx, int enable) {
+    if (!ctx) return FLUX_STATUS_INVALID_ARGUMENT;
+    flux_set_embed_cache(ctx, enable);
+    return FLUX_STATUS_OK;
+}
+
+flux_status_t flux_generate_status(flux_ctx *ctx, const char *prompt,
+                                   const flux_params *params, flux_image **out_image) {
+    if (!ctx || !prompt || !out_image) return FLUX_STATUS_INVALID_ARGUMENT;
+    *out_image = flux_generate(ctx, prompt, params);
+    return flux_status_from_ptr(*out_image);
+}
+
+flux_status_t flux_img2img_status(flux_ctx *ctx, const char *prompt,
+                                  const flux_image *input, const flux_params *params,
+                                  flux_image **out_image) {
+    if (!ctx || !prompt || !input || !out_image) return FLUX_STATUS_INVALID_ARGUMENT;
+    *out_image = flux_img2img(ctx, prompt, input, params);
+    return flux_status_from_ptr(*out_image);
+}
+
+flux_status_t flux_multiref_status(flux_ctx *ctx, const char *prompt,
+                                   const flux_image **refs, int num_refs,
+                                   const flux_params *params, flux_image **out_image) {
+    if (!ctx || !prompt || !refs || num_refs < 0 || !out_image) return FLUX_STATUS_INVALID_ARGUMENT;
+    *out_image = flux_multiref(ctx, prompt, refs, num_refs, params);
+    return flux_status_from_ptr(*out_image);
+}
+
+flux_status_t flux_generate_with_embeddings_status(flux_ctx *ctx,
+                                                   const float *text_emb, int text_seq,
+                                                   const flux_params *params,
+                                                   flux_image **out_image) {
+    if (!ctx || !text_emb || text_seq <= 0 || !out_image) return FLUX_STATUS_INVALID_ARGUMENT;
+    *out_image = flux_generate_with_embeddings(ctx, text_emb, text_seq, params);
+    return flux_status_from_ptr(*out_image);
+}
+
+flux_status_t flux_generate_with_embeddings_and_noise_status(flux_ctx *ctx,
+                                                             const float *text_emb, int text_seq,
+                                                             const float *noise, int noise_size,
+                                                             const flux_params *params,
+                                                             flux_image **out_image) {
+    if (!ctx || !text_emb || text_seq <= 0 || !noise || noise_size <= 0 || !out_image) {
+        return FLUX_STATUS_INVALID_ARGUMENT;
+    }
+    *out_image = flux_generate_with_embeddings_and_noise(ctx, text_emb, text_seq,
+                                                         noise, noise_size, params);
+    return flux_status_from_ptr(*out_image);
 }

@@ -20,8 +20,65 @@ jobs:
       - name: Smoke mode (generic, no weights)
         run: ./flux --smoke
 
+      - name: Capture smoke timing JSON (generic)
+        run: |
+          mkdir -p artifacts
+          ./flux --smoke --timing --json-out artifacts/generic-smoke-timing.json
+
+      - name: Upload timing JSON artifact (generic)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: generic-smoke-timing
+          path: artifacts/generic-smoke-timing.json
+          if-no-files-found: warn
+
       - name: Build BLAS backend
         run: make blas
 
       - name: Smoke mode (BLAS, no weights)
+        run: ./flux --smoke
+
+      - name: Capture smoke timing JSON (BLAS)
+        run: |
+          mkdir -p artifacts
+          ./flux --smoke --timing --json-out artifacts/blas-smoke-timing.json
+
+      - name: Upload timing JSON artifact (BLAS)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: blas-smoke-timing
+          path: artifacts/blas-smoke-timing.json
+          if-no-files-found: warn
+
+  golden-tests-generic:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build generic backend
+        run: make generic
+
+      - name: Run deterministic golden tests (generic)
+        run: python3 tests/python/test_golden.py --flux-binary ./flux
+
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build ASan+UBSan binary
+        run: make asan
+
+      - name: Smoke mode (ASan+UBSan, no weights)
+        run: ./flux --smoke
+
+      - name: Build UBSan binary
+        run: make ubsan
+
+      - name: Smoke mode (UBSan, no weights)
         run: ./flux --smoke

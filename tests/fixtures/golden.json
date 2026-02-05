@@ -1,0 +1,46 @@
+{
+  "backend": "generic",
+  "mode": "deterministic-smoke",
+  "cases": [
+    {
+      "name": "tiny_seed_1",
+      "prompt": "golden tiny",
+      "width": 64,
+      "height": 64,
+      "steps": 1,
+      "seed": 1,
+      "expected_exit_code": 0,
+      "expected_sha256": "b2b07c217a3b7598a897b33d8069e25916883b0e3857ca4741017a639b14a067"
+    },
+    {
+      "name": "rect_seed_42",
+      "prompt": "golden rectangle",
+      "width": 96,
+      "height": 64,
+      "steps": 2,
+      "seed": 42,
+      "expected_exit_code": 0,
+      "expected_sha256": "1fa31d9e14d435ab0803add9ba19447f9960bfd0200d20e39989c4c5c9a9e73f"
+    },
+    {
+      "name": "square_seed_777",
+      "prompt": "golden default-like",
+      "width": 80,
+      "height": 80,
+      "steps": 4,
+      "seed": 777,
+      "expected_exit_code": 0,
+      "expected_sha256": "667f5bd4a9cd9a56ebbd66ce8d8e56c54df60b3e5714965e34939b529df8b634"
+    },
+    {
+      "name": "wide_seed_2025",
+      "prompt": "golden wide",
+      "width": 128,
+      "height": 64,
+      "steps": 3,
+      "seed": 2025,
+      "expected_exit_code": 0,
+      "expected_sha256": "5aab180f5ff7a119c41fafc9bb9034f264ee01c47ad0c527185183e57458ae9b"
+    }
+  ]
+}

@@ -27,8 +27,9 @@ TARGET = flux
 LIB = libflux.a
 
 DEBUG_CFLAGS = -Wall -Wextra -g -O0 -DDEBUG -fsanitize=address -Iinclude/flux
+SANITIZER_COMMON = -Wall -Wextra -O1 -g -fno-omit-frame-pointer -Iinclude/flux -DGENERIC_BUILD
 
-.PHONY: all clean debug lib install info test pngtest help generic blas mps
+.PHONY: all clean debug lib install info test pngtest help generic blas mps golden-test asan ubsan
 
 all: help
 
@@ -38,6 +39,8 @@ help:
 	@echo "Choose a backend:"
 	@echo "  make generic  - Pure C, no dependencies (slow)"
 	@echo "  make blas     - With BLAS acceleration (~30x faster)"
+	@echo "  make asan     - Build with Address+Undefined sanitizers (clang)"
+	@echo "  make ubsan    - Build with Undefined sanitizer (clang)"
 ifeq ($(UNAME_S),Darwin)
 ifeq ($(UNAME_M),arm64)
 	@echo "  make mps      - Apple Silicon with Metal GPU (fastest)"
@@ -117,11 +120,29 @@ debug: CFLAGS = $(DEBUG_CFLAGS)
 debug: LDFLAGS += -fsanitize=address
 debug: clean $(TARGET)
 
+
+asan: CC = clang
+asan: CFLAGS = $(SANITIZER_COMMON) -fsanitize=address,undefined
+asan: LDFLAGS = -lm -fsanitize=address,undefined
+asan: clean $(TARGET)
+	@echo ""
+	@echo "Built with ASan+UBSan (clang, generic backend)"
+
+ubsan: CC = clang
+ubsan: CFLAGS = $(SANITIZER_COMMON) -fsanitize=undefined
+ubsan: LDFLAGS = -lm -fsanitize=undefined
+ubsan: clean $(TARGET)
+	@echo ""
+	@echo "Built with UBSan (clang, generic backend)"
+
 test:
 	@python3 run_test.py --flux-binary ./$(TARGET)
 
 test-quick:
 	@python3 run_test.py --flux-binary ./$(TARGET) --quick
+
+golden-test:
+	@python3 tests/python/test_golden.py --flux-binary ./$(TARGET)
 
 pngtest:
 	@echo "Running PNG compression compare test..."
