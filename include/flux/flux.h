@@ -183,6 +183,9 @@ void flux_get_last_qwen3_diag(int *out_tokens,
 void flux_get_last_transformer_diag(const char **out_dtype_path,
                                     const char **out_gemm_routing);
 
+/* Enable/disable detailed denoise timing output from sampler. */
+void flux_set_timing_enabled(int enable);
+
 /*
  * Text-to-image generation.
  * Returns newly allocated image, caller must free with flux_image_free().

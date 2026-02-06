@@ -2876,12 +2876,17 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     }
 #endif
 
-    g_transformer_last_dtype_path = "fp32";
+    if (flux_get_compute_backend() == FLUX_BACKEND_CUDA && flux_get_compute_dtype() == FLUX_DTYPE_FP16) {
+        g_transformer_last_dtype_path = "fp16";
+        g_transformer_last_gemm_routing = "cuBLASLt (flux_cuda_gemm_fp16)";
+    } else {
+        g_transformer_last_dtype_path = "fp32";
 #ifdef USE_BLAS
-    g_transformer_last_gemm_routing = "BLAS (cblas_sgemm)";
+        g_transformer_last_gemm_routing = "BLAS (cblas_sgemm)";
 #else
-    g_transformer_last_gemm_routing = "fallback kernels";
+        g_transformer_last_gemm_routing = "fallback kernels";
 #endif
+    }
 
     /* Project image latent to hidden */
     float *img_hidden = tf->img_hidden;

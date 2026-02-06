@@ -11,6 +11,39 @@
 #include <stddef.h>
 #include <stdint.h>
 
+typedef enum {
+    FLUX_BACKEND_CPU = 0,
+    FLUX_BACKEND_CUDA = 1,
+} flux_backend_t;
+
+typedef enum {
+    FLUX_DTYPE_FP16 = 0,
+    FLUX_DTYPE_BF16 = 1,
+    FLUX_DTYPE_FP32 = 2,
+} flux_dtype_t;
+
+typedef enum {
+    FLUX_DEVICE_CPU = 0,
+    FLUX_DEVICE_CUDA = 1,
+} flux_device_t;
+
+typedef struct {
+    void *ptr;
+    size_t bytes;
+    flux_dtype_t dtype;
+    flux_device_t device;
+} flux_buffer;
+
+void flux_set_compute_policy(flux_backend_t backend, flux_dtype_t dtype);
+flux_backend_t flux_get_compute_backend(void);
+flux_dtype_t flux_get_compute_dtype(void);
+void flux_reset_cuda_gemm_counter(void);
+uint64_t flux_get_cuda_gemm_counter(void);
+
+int flux_buffer_alloc(flux_buffer *buf, size_t bytes, flux_dtype_t dtype, flux_device_t device);
+void flux_buffer_free(flux_buffer *buf);
+int flux_buffer_copy(flux_buffer *dst, const flux_buffer *src, size_t bytes);
+
 /* Forward declarations */
 struct flux_image;
 
