@@ -11,6 +11,8 @@ extern "C" {
 
 typedef uint16_t flux_fp16;
 
+#define CUDA_HOME_STR "/usr/local/cuda-13.0"
+
 #define FLUX_CUDA_CHECK(expr) \
     do { \
         int _err = (expr); \
