@@ -1101,6 +1101,35 @@ static int qwen3_check_work_allocations(const qwen3_model_t *model) {
     return 1;
 }
 
+static int qwen3_allocate_work_buffers(qwen3_model_t *model, int seq_len, int hidden,
+                                       int num_heads, int num_kv_heads,
+                                       int head_dim, int intermediate) {
+    if (!model) return 0;
+
+    model->hidden_state = malloc(seq_len * hidden * sizeof(float));
+    model->residual = malloc(seq_len * hidden * sizeof(float));
+    model->q_buf = malloc(seq_len * num_heads * head_dim * sizeof(float));
+    model->k_buf = malloc(seq_len * num_kv_heads * head_dim * sizeof(float));
+    model->v_buf = malloc(seq_len * num_kv_heads * head_dim * sizeof(float));
+    model->attn_scores = malloc(num_heads * seq_len * seq_len * sizeof(float));
+    model->attn_out = malloc(seq_len * num_heads * head_dim * sizeof(float));
+    model->mlp_gate = malloc(seq_len * intermediate * sizeof(float));
+    model->mlp_up = malloc(seq_len * intermediate * sizeof(float));
+    model->mlp_out = malloc(seq_len * hidden * sizeof(float));
+    model->norm_buf = malloc(seq_len * hidden * sizeof(float));
+
+    model->attn_q_head = malloc(seq_len * head_dim * sizeof(float));
+    model->attn_k_head_t = malloc(head_dim * seq_len * sizeof(float));
+    model->attn_v_head = malloc(seq_len * head_dim * sizeof(float));
+    model->attn_out_head = malloc(seq_len * head_dim * sizeof(float));
+
+    for (int i = 0; i < 3; i++) {
+        model->layer_outputs[i] = malloc(seq_len * hidden * sizeof(float));
+    }
+
+    return qwen3_check_work_allocations(model);
+}
+
 /* Free a single layer's weights (used in mmap streaming mode) */
 static void free_layer_weights(qwen3_layer_t *layer) {
     free(layer->input_layernorm_weight);
@@ -1192,29 +1221,8 @@ qwen3_model_t *qwen3_model_load(const char *model_dir) {
     int head_dim = QWEN3_HEAD_DIM;
     int intermediate = QWEN3_INTERMEDIATE_SIZE;
 
-    model->hidden_state = malloc(seq_len * hidden * sizeof(float));
-    model->residual = malloc(seq_len * hidden * sizeof(float));
-    model->q_buf = malloc(seq_len * num_heads * head_dim * sizeof(float));
-    model->k_buf = malloc(seq_len * num_kv_heads * head_dim * sizeof(float));
-    model->v_buf = malloc(seq_len * num_kv_heads * head_dim * sizeof(float));
-    model->attn_scores = malloc(num_heads * seq_len * seq_len * sizeof(float));
-    model->attn_out = malloc(seq_len * num_heads * head_dim * sizeof(float));
-    model->mlp_gate = malloc(seq_len * intermediate * sizeof(float));
-    model->mlp_up = malloc(seq_len * intermediate * sizeof(float));
-    model->mlp_out = malloc(seq_len * hidden * sizeof(float));
-    model->norm_buf = malloc(seq_len * hidden * sizeof(float));
-
-    /* Pre-allocate attention work buffers */
-    model->attn_q_head = malloc(seq_len * head_dim * sizeof(float));
-    model->attn_k_head_t = malloc(head_dim * seq_len * sizeof(float));
-    model->attn_v_head = malloc(seq_len * head_dim * sizeof(float));
-    model->attn_out_head = malloc(seq_len * head_dim * sizeof(float));
-
-    for (int i = 0; i < 3; i++) {
-        model->layer_outputs[i] = malloc(seq_len * hidden * sizeof(float));
-    }
-
-    if (!qwen3_check_work_allocations(model)) {
+    if (!qwen3_allocate_work_buffers(model, seq_len, hidden, num_heads,
+                                     num_kv_heads, head_dim, intermediate)) {
         fprintf(stderr, "qwen3_model_load: out of memory allocating work buffers\n");
         goto error;
     }
@@ -1302,27 +1310,8 @@ qwen3_model_t *qwen3_model_load_mmap(const char *model_dir) {
     int head_dim = QWEN3_HEAD_DIM;
     int intermediate = QWEN3_INTERMEDIATE_SIZE;
 
-    model->hidden_state = malloc(seq_len * hidden * sizeof(float));
-    model->residual = malloc(seq_len * hidden * sizeof(float));
-    model->q_buf = malloc(seq_len * num_heads * head_dim * sizeof(float));
-    model->k_buf = malloc(seq_len * num_kv_heads * head_dim * sizeof(float));
-    model->v_buf = malloc(seq_len * num_kv_heads * head_dim * sizeof(float));
-    model->attn_scores = malloc(num_heads * seq_len * seq_len * sizeof(float));
-    model->attn_out = malloc(seq_len * num_heads * head_dim * sizeof(float));
-    model->mlp_gate = malloc(seq_len * intermediate * sizeof(float));
-    model->mlp_up = malloc(seq_len * intermediate * sizeof(float));
-    model->mlp_out = malloc(seq_len * hidden * sizeof(float));
-    model->norm_buf = malloc(seq_len * hidden * sizeof(float));
-    model->attn_q_head = malloc(seq_len * head_dim * sizeof(float));
-    model->attn_k_head_t = malloc(head_dim * seq_len * sizeof(float));
-    model->attn_v_head = malloc(seq_len * head_dim * sizeof(float));
-    model->attn_out_head = malloc(seq_len * head_dim * sizeof(float));
-
-    for (int i = 0; i < 3; i++) {
-        model->layer_outputs[i] = malloc(seq_len * hidden * sizeof(float));
-    }
-
-    if (!qwen3_check_work_allocations(model)) {
+    if (!qwen3_allocate_work_buffers(model, seq_len, hidden, num_heads,
+                                     num_kv_heads, head_dim, intermediate)) {
         fprintf(stderr, "qwen3_model_load_mmap: out of memory allocating work buffers\n");
         goto error;
     }

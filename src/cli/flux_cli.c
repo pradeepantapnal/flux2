@@ -118,6 +118,18 @@ static void trim_trailing(char *s) {
     }
 }
 
+static void copy_cstr_trunc(char *dst, size_t dst_size, const char *src) {
+    if (!dst || dst_size == 0) return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    size_t n = strlen(src);
+    if (n >= dst_size) n = dst_size - 1;
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
 /* Case-insensitive prefix match. */
 static int starts_with_ci(const char *s, const char *prefix) {
     while (*prefix) {
@@ -211,9 +223,14 @@ static int create_tmpdir(void) {
     return 0;
 }
 
-static void get_image_path(char *buf, size_t size) {
+static int get_image_path(char *buf, size_t size) {
     state.image_count++;
-    snprintf(buf, size, "%s/image-%04d.png", state.tmpdir, state.image_count);
+    int n = snprintf(buf, size, "%s/image-%04d.png", state.tmpdir, state.image_count);
+    if (n < 0 || (size_t)n >= size) {
+        fprintf(stderr, "Error: image path too long\n");
+        return -1;
+    }
+    return 0;
 }
 
 /* ======================================================================
@@ -329,12 +346,14 @@ static int generate_image(const char *prompt, const char *ref_image,
 
     /* Save to temp */
     char path[CLI_MAX_PATH];
-    get_image_path(path, sizeof(path));
+    if (get_image_path(path, sizeof(path)) != 0) {
+        return -1;
+    }
     flux_image_save_with_seed(img, path, actual_seed);
     flux_image_free(img);
 
     /* Update last image and register as reference */
-    strncpy(state.last_image, path, sizeof(state.last_image) - 1);
+    copy_cstr_trunc(state.last_image, sizeof(state.last_image), path);
     int ref_id = ref_add(path);
 
     printf("Done -> %s (ref $%d) [%.2fs]\n", path, ref_id, elapsed);
@@ -407,12 +426,14 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
 
     /* Save to temp */
     char path[CLI_MAX_PATH];
-    get_image_path(path, sizeof(path));
+    if (get_image_path(path, sizeof(path)) != 0) {
+        return -1;
+    }
     flux_image_save_with_seed(img, path, actual_seed);
     flux_image_free(img);
 
     /* Update last image and register as reference */
-    strncpy(state.last_image, path, sizeof(state.last_image) - 1);
+    copy_cstr_trunc(state.last_image, sizeof(state.last_image), path);
     int ref_id = ref_add(path);
 
     printf("Done -> %s (ref $%d) [%.2fs]\n", path, ref_id, elapsed);
@@ -498,11 +519,14 @@ static void cmd_load(char *arg) {
 
     /* Save to temp so we have a consistent path */
     char path[CLI_MAX_PATH];
-    get_image_path(path, sizeof(path));
+    if (get_image_path(path, sizeof(path)) != 0) {
+        flux_image_free(img);
+        return;
+    }
     flux_image_save(img, path);
 
     /* Update state and register as reference */
-    strncpy(state.last_image, path, sizeof(state.last_image) - 1);
+    copy_cstr_trunc(state.last_image, sizeof(state.last_image), path);
     int ref_id = ref_add(path);
     state.width = img->width;
     state.height = img->height;

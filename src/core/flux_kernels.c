@@ -1032,6 +1032,18 @@ void flux_flash_attention(float *out, const float *Q, const float *K, const floa
 
     /* Allocate tile scratch buffer */
     float *tile_scores = (float *)malloc(q_tile_size * k_tile_size * sizeof(float));
+    float *Q_contig = (float *)malloc(seq_q * head_dim * sizeof(float));
+    float *K_contig = (float *)malloc(seq_k * head_dim * sizeof(float));
+    float *V_contig = (float *)malloc(seq_k * head_dim * sizeof(float));
+    float *out_contig = (float *)malloc(seq_q * head_dim * sizeof(float));
+    if (!tile_scores || !Q_contig || !K_contig || !V_contig || !out_contig) {
+        free(tile_scores);
+        free(Q_contig);
+        free(K_contig);
+        free(V_contig);
+        free(out_contig);
+        return;
+    }
 
     /* Process each head */
     for (int h = 0; h < heads; h++) {
@@ -1044,77 +1056,42 @@ void flux_flash_attention(float *out, const float *Q, const float *K, const floa
         int hidden = heads * head_dim;
 
         /* For small sequences, use simple non-tiled version */
+        for (int i = 0; i < seq_q; i++) {
+            for (int d = 0; d < head_dim; d++) {
+                Q_contig[i * head_dim + d] = Q_head[i * hidden + d];
+            }
+        }
+        for (int j = 0; j < seq_k; j++) {
+            for (int d = 0; d < head_dim; d++) {
+                K_contig[j * head_dim + d] = K_head[j * hidden + d];
+                V_contig[j * head_dim + d] = V_head[j * hidden + d];
+            }
+        }
+
         if (seq_q <= 64 && seq_k <= 128) {
-            /* Extract head data into contiguous buffers */
-            float *Q_contig = (float *)malloc(seq_q * head_dim * sizeof(float));
-            float *K_contig = (float *)malloc(seq_k * head_dim * sizeof(float));
-            float *V_contig = (float *)malloc(seq_k * head_dim * sizeof(float));
-            float *out_contig = (float *)malloc(seq_q * head_dim * sizeof(float));
-
-            for (int i = 0; i < seq_q; i++) {
-                for (int d = 0; d < head_dim; d++) {
-                    Q_contig[i * head_dim + d] = Q_head[i * hidden + d];
-                }
-            }
-            for (int j = 0; j < seq_k; j++) {
-                for (int d = 0; d < head_dim; d++) {
-                    K_contig[j * head_dim + d] = K_head[j * hidden + d];
-                    V_contig[j * head_dim + d] = V_head[j * hidden + d];
-                }
-            }
-
+            /* For small sequences, use simple non-tiled version */
             flash_attention_head(out_contig, Q_contig, K_contig, V_contig,
                                  seq_q, seq_k, head_dim, scale);
-
-            /* Copy back with stride */
-            for (int i = 0; i < seq_q; i++) {
-                for (int d = 0; d < head_dim; d++) {
-                    out_head[i * hidden + d] = out_contig[i * head_dim + d];
-                }
-            }
-
-            free(Q_contig);
-            free(K_contig);
-            free(V_contig);
-            free(out_contig);
         } else {
-            /* For larger sequences, use tiled version with strided access */
-            /* Extract head data into contiguous buffers for BLAS efficiency */
-            float *Q_contig = (float *)malloc(seq_q * head_dim * sizeof(float));
-            float *K_contig = (float *)malloc(seq_k * head_dim * sizeof(float));
-            float *V_contig = (float *)malloc(seq_k * head_dim * sizeof(float));
-            float *out_contig = (float *)malloc(seq_q * head_dim * sizeof(float));
-
-            for (int i = 0; i < seq_q; i++) {
-                for (int d = 0; d < head_dim; d++) {
-                    Q_contig[i * head_dim + d] = Q_head[i * hidden + d];
-                }
-            }
-            for (int j = 0; j < seq_k; j++) {
-                for (int d = 0; d < head_dim; d++) {
-                    K_contig[j * head_dim + d] = K_head[j * hidden + d];
-                    V_contig[j * head_dim + d] = V_head[j * hidden + d];
-                }
-            }
-
+            /* For larger sequences, use tiled version */
             flash_attention_head_tiled(out_contig, Q_contig, K_contig, V_contig,
-                                        seq_q, seq_k, head_dim, scale,
-                                        tile_scores, q_tile_size, k_tile_size);
-
-            /* Copy back with stride */
-            for (int i = 0; i < seq_q; i++) {
-                for (int d = 0; d < head_dim; d++) {
-                    out_head[i * hidden + d] = out_contig[i * head_dim + d];
-                }
-            }
-
-            free(Q_contig);
-            free(K_contig);
-            free(V_contig);
-            free(out_contig);
+                                       seq_q, seq_k, head_dim, scale,
+                                       tile_scores, q_tile_size, k_tile_size);
         }
+
+        /* Copy back with stride */
+        for (int i = 0; i < seq_q; i++) {
+            for (int d = 0; d < head_dim; d++) {
+                out_head[i * hidden + d] = out_contig[i * head_dim + d];
+            }
+        }
+
     }
 
+    free(Q_contig);
+    free(K_contig);
+    free(V_contig);
+    free(out_contig);
     free(tile_scores);
 }
 
