@@ -321,16 +321,31 @@ qwen3_tokenizer_t *qwen3_tokenizer_load(const char *tokenizer_json_path) {
         return NULL;
     }
 
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return NULL;
+    }
     long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    if (size < 0) {
+        fclose(f);
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return NULL;
+    }
 
     char *json = malloc(size + 1);
     if (!json) {
         fclose(f);
         return NULL;
     }
-    fread(json, 1, size, f);
+    size_t read_bytes = fread(json, 1, (size_t)size, f);
+    if (read_bytes != (size_t)size) {
+        free(json);
+        fclose(f);
+        return NULL;
+    }
     json[size] = '\0';
     fclose(f);
 
